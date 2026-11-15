@@ -1,19 +1,25 @@
 # 🤖 Open WebUI on Kubernetes
 
-A ready-to-run, self-hosted [Open WebUI](https://openwebui.com) stack for a
-single-node Kubernetes cluster — secured by default and light enough for one
-modest server.
+**Your local AI, ready for the whole family or team — not just you.** One
+deployment turns your OpenAI-compatible model endpoint into a ChatGPT-style
+workspace where every person signs in under their own account, with their
+own private chat history, uploads, and settings — and gets their own `sk-`
+API key, so personal scripts, IDE plugins, and apps use the shared model
+under each user's own identity and permissions. The first account you create
+is the admin; every new signup waits in a pending queue until you approve
+them.
 
-Open WebUI is a chat app for large language models (LLMs). This repository
-installs it with the pieces a real setup needs: a PostgreSQL database, a
-private SearXNG web search, Redis for streaming, and nightly backups that
-check themselves. Everything runs on a single-node Kubernetes (K3s) cluster:
+This repository is the deployment layer: a ready-to-run
+[Open WebUI](https://openwebui.com) stack — a PostgreSQL database, a private
+SearXNG web search, Redis for streaming, and nightly backups that check
+themselves — on a single-node Kubernetes (K3s) cluster. Secured by default:
 no container runs as root, every credential lives in a Kubernetes Secret that
 K3s encrypts at rest, and Helm charts deploy the whole thing with one command.
 
 > **🧭 New here?** Start with [What you need](#-what-you-need), then follow
-> [Quick start](#-quick-start). You need a model endpoint and a Brave Search API
-> key. Prefer to have an AI coding agent drive the deployment? See
+> [Quick start](#-quick-start). You need a model endpoint; the Brave Search
+> API key is optional (Bing answers without one). Prefer to have an AI coding
+> agent drive the deployment? See
 > [AI prompt for deploying with an AI agent](#-ai-prompt-for-deploying-with-an-ai-agent).
 
 ---
@@ -44,11 +50,18 @@ K3s encrypts at rest, and Helm charts deploy the whole thing with one command.
 
 ## ✨ What you get
 
-**🪶 Lightweight.** One small Kubernetes cluster (K3s) on a single machine runs
-the whole stack — app, database, search engine, cache, and the backup jobs. No
-GPU, no
-external services beyond your model endpoint; the `small` sizing profile
-starts at 4 CPU cores and 8 GB of RAM.
+**👥 Built for more than one person.** This is the whole point: a local model
+endpoint becomes a shared service with private per-user boundaries. Everyone
+signs in with their own account (built-in form or Google sign-in), sees only
+their own conversations and files, and mints their own `sk-` API keys for
+programmatic access — authenticated as that user, with their role and model
+access. Admins approve new signups and manage users from the web UI. See
+[Login options](#-login-options).
+
+**🪶 Lightweight.** One small Kubernetes cluster (K3s) on a single machine
+runs the whole stack — app, database, search engine, cache, and the backup
+jobs. No GPU, no external services beyond your model endpoint; the `small`
+sizing profile starts at 4 CPU cores and 8 GB of RAM.
 
 **🔒 Secure by default.**
 
@@ -71,13 +84,13 @@ starts at 4 CPU cores and 8 GB of RAM.
 
 | Piece | What it does here |
 |---|---|
-| **Open WebUI** | ChatGPT-style UI for any OpenAI-compatible model. Upload PDFs, Word files, or text and ask questions about them — embeddings run in-process, so there is no extra embedding service to pay for |
+| **Open WebUI** | The multi-user workspace: ChatGPT-style chat with any OpenAI-compatible model, per-user history, uploads, and `sk-` API keys. Ask questions of PDFs, Word files, or text — embeddings run in-process, so there is no extra embedding service to pay for |
 | **PostgreSQL** | The app's database. The nightly dump is restored into a scratch database and compared against the live one before the archive counts as a backup |
 | **SearXNG** | Private web search inside the cluster — active with a Brave Search API key, with Bing as the no-key fallback. Your searches are not tied to your account |
 | **Redis** | The app's WebSocket/streaming cache |
 
-- **🔑 Login your way** — the built-in login form works out of the box; Google
-  sign-in is available if you have a domain and TLS. See
+- **🔑 Login your way** — the built-in form works with no domain or TLS;
+  Google sign-in needs a public `https://` URL. See
   [Login options](#-login-options).
 - **💾 Backups you can trust** — verified database dumps and volume archives
   go to a **second path**, not the same disk as the live data, and
