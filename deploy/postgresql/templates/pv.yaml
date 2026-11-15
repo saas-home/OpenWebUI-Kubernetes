@@ -1,0 +1,32 @@
+{{- if .Values.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ include "postgresql.fullname" . }}-pv
+  labels:
+    {{- include "postgresql.labels" . | nindent 4 }}
+spec:
+  capacity:
+    storage: {{ .Values.persistence.size }}
+  accessModes:
+    - {{ .Values.persistence.accessMode }}
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: {{ .Values.persistence.storageClass }}
+  local:
+    {{- /* The data root is site-specific, so it lives in .env (LIVE_DATA_PATH,
+            default ~/.open-webui/live-data) and deploy.sh injects it. A PV
+            rendered with an empty path would be created and bind to nothing. */}}
+    path: {{ required "persistence.localPath is empty — run ./deploy.sh (it injects it from LIVE_DATA_PATH in .env)" .Values.persistence.localPath | quote }}
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values:
+          {{- /* A local PV is only schedulable with nodeAffinity, and the field is
+                  immutable afterwards, so an empty value stops the render rather
+                  than produce a PV no pod can ever use. See persistence.nodeName
+                  in values.yaml for where the value comes from. */}}
+          - {{ required "persistence.nodeName is empty — set K3S_NODE_NAME in .env (see .env.example) and run ./deploy.sh" .Values.persistence.nodeName | quote }}
+{{- end }}

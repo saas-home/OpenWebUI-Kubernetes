@@ -1,0 +1,184 @@
+image:
+  repository: postgres
+  tag: "18.7-alpine"
+  pullPolicy: IfNotPresent
+
+# The database runs as the image's postgres account (uid 70), not root. This
+# is the searxng pattern: runAsNonRoot is the part doing the work — the
+# kubelet refuses to start the pod if the image would run as root, so
+# deleting runAsUser fails the rollout visibly instead of silently restoring
+# root. fsGroup is what makes non-root possible on a hostPath PV at all: the
+# kubelet takes ownership of the volume's group (70) at mount, so the
+# container can write to a directory it does not own. setup.sh creates
+# <LIVE>/postgresql as 70:70 to match; an existing root-owned directory is
+# rescued by fsGroup, but ./deploy/setup.sh will ask you to chown it.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 70
+  runAsGroup: 70
+  fsGroup: 70
+
+replicaCount: 1
+
+service:
+  type: NodePort
+  port: 5432
+  nodePort: 30432
+
+auth:
+  database: openwebui
+  username: openwebui
+  # The password is NOT stored here and never was in a tracked file. It lives in
+  # the pre-created `postgres` Secret (deploy/secret-init.sh), encrypted at rest
+  # by K3s --secrets-encryption. This chart does not create the Secret: helm does
+  # not own it, so an upgrade can never rewrite or delete the credential, and
+  # uninstall.sh stage 2 removes it explicitly.
+  existingSecret: "postgres"
+
+# Extra environment variables passed to the container.
+# Note: POSTGRES_MAX_CONNECTIONS and POSTGRES_SHARED_BUFFERS are NOT recognized as env vars
+# by the postgres Docker image. Use the 'command' override below instead.
+extraEnvVars: []
+
+# Postgres tuning. `command` replaces the image ENTRYPOINT, so it must start with
+# docker-entrypoint.sh — a command that begins with `postgres` skips initdb and
+# never runs /docker-entrypoint-initdb.d.
+#
+# ./deploy.sh renders these flags from MESSAGE_SCALE in .env, so this block is
+# what a bare `helm template` gets, not what a deploy writes. The profile table
+# lives in deploy/postgresql/deploy.sh, with an identical copy in the open-webui
+# script; edit it there, not here. What each flag is for:
+#   max_connections        one pool per uvicorn worker, so the ceiling must clear
+#                          workers x (pool + overflow); the profile keeps 40 spare.
+#   shared_buffers         Postgres's own cache. It must fit the container's
+#                          memory limit, which the same profile row sets.
+#   effective_cache_size   a planner cost hint, allocates nothing. Kept at roughly
+#                          shared_buffers + the page cache the limit leaves room
+#                          for, so it never claims more than the cgroup can hold.
+#   work_mem               per sort node, not per connection: 16 MB everywhere,
+#                          because max_connections x work_mem would not fit.
+#   random_page_cost       the data is on an SSD.
+# Verify the running values with: kubectl exec deploy/postgres -- psql -U openwebui -d openwebui -tAc \
+#   "select name, setting, unit from pg_settings where name in ('shared_buffers','max_connections')"
+command:
+  - docker-entrypoint.sh
+  - postgres
+  - -c
+  - max_connections=100
+  - -c
+  - shared_buffers=512MB
+  - -c
+  - effective_cache_size=1GB
+  - -c
+  - work_mem=16MB
+  - -c
+  - maintenance_work_mem=256MB
+  - -c
+  - wal_compression=on
+  - -c
+  - random_page_cost=1.1
+  - -c
+  - max_wal_size=2GB
+  - -c
+  - max_parallel_workers_per_gather=4
+
+persistence:
+  enabled: true
+  storageClass: local-storage
+  size: 10Gi
+  accessMode: ReadWriteOnce
+  # Deliberately empty: the data root is site-specific, so it lives in
+  # LIVE_DATA_PATH in .env (default ~/.open-webui/live-data) and ./deploy.sh
+  # injects <root>/postgresql here. templates/pv.yaml refuses to render
+  # without it — a bare `helm upgrade` cannot produce an unmountable PV.
+  localPath: ""
+  # The K3s node name this PV pins itself to, which is the value of the
+  # kubernetes.io/hostname label — not necessarily what `hostname` prints. Site
+  # specific, so it comes from K3S_NODE_NAME in .env: deploy.sh injects it, and
+  # templates/pv.yaml refuses to render without it. Find yours with
+  # `kubectl get nodes`. nodeAffinity is immutable on a local PV, so changing the
+  # value against an existing PV makes the next upgrade fail; move the data and
+  # recreate the PV instead.
+  nodeName: ""
+
+backup:
+  enabled: true
+  schedule: "0 2 * * *"
+  # Same non-root posture as the server pod: pg_dump/psql/gzip need no
+  # privilege, and fsGroup gives the backup archives group ownership 70 on
+  # both hostPath mounts (the first-copy dir and the off-disk target). The
+  # deletion loops in the job work off directory write permission, which
+  # fsGroup also grants, so a pre-existing root-owned archive from the
+  # root-entrypoint era can still be pruned.
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 70
+    runAsGroup: 70
+    fsGroup: 70
+  # The backup job held no requests or limits at all, so a dump of a growing
+  # database could burst into any spare capacity. These are the `small` profile's
+  # values; ./deploy.sh renders them from MESSAGE_SCALE, and the envelope grows
+  # with the profile because the database the job dumps does.
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "300m"
+      memory: "512Mi"
+  # Days of archives to keep, counted by distinct day. Hand-run jobs on the same
+  # day share one slot and cannot evict older days.
+  retentionCount: 7
+  # Seconds after the scheduled minute within which a missed run still starts. Without
+  # it a node that is down at 02:00 UTC skips the night silently. See the template note.
+  # 0 or a deleted line both fall back to 3600: the template renders this with a default.
+  startingDeadlineSeconds: 3600
+  # Also injected by ./deploy.sh from LIVE_DATA_PATH (see persistence.localPath).
+  hostPath: ""
+  # One archive per database per run. List ONLY databases that actually exist:
+  # the job treats a missing database as a failed run and exits non-zero, even
+  # though every other dump verified. This deployment creates just `openwebui`
+  # (extraDatabases is empty), so `localai` — present on the original server,
+  # absent here — is deliberately not listed. Add a database here when you add
+  # it to the server, or it silently has no backup coverage.
+  databases:
+    - openwebui
+  # Second copy outside the data root. ./deploy.sh injects it from
+  # BACKUP_DATA_PATH (default ~/.open-webui/backup-data). The production
+  # recommendation (advisory, not enforced here): make that second path a
+  # different physical device or a remote mount, because one disk holding
+  # both the data and its only backups dies together.
+  offDisk:
+    enabled: true
+    hostPath: ""
+    retentionCount: 7
+  verify:
+    # The newest archive is restored into this database on every run and compared
+    # against the live one by table inventory, then dropped.
+    scratchDatabase: restore_verify
+
+# The `small` message-scale profile. ./deploy.sh renders this from MESSAGE_SCALE,
+# so it is what a bare `helm template` gets, not what a deploy writes. The limits
+# sum with the other workloads to the profile's RAM budget; the requests sum to
+# about half of it and the rest stays page cache, which is what makes reads fast.
+resources:
+  requests:
+    cpu: "500m"
+    memory: "1Gi"
+  limits:
+    cpu: "1"
+    memory: "2Gi"
+
+# Extra databases to create at startup via init scripts.
+# PostgreSQL Docker entrypoint automatically executes .sh files in /docker-entrypoint-initdb.d/
+# on first-time data directory initialization only.
+# Each entry here generates a shell script that creates a database and user.
+extraDatabases: []
+# Example:
+# extraDatabases:
+#   - name: myapp
+#     username: myapp
+#     password: generate-one-for-this-database
+# This file is tracked, so a password written here lands in git history even after
+# you delete the line. Use it for a throwaway database only; for anything real, keep
+# the credential in the repo-root .env and create the role with CREATE USER in psql.

@@ -1,0 +1,131 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "searxng.fullname" . }}
+  labels:
+    {{- include "searxng.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "searxng.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "searxng.selectorLabels" . | nindent 8 }}
+    spec:
+      enableServiceLinks: false
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+      - name: ensure-json-format
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        # Same image as the main container, and it writes the settings.yml that
+        # container reads, so it has to be pulled under the same policy. Omitting this
+        # lets Kubernetes default the init container to IfNotPresent while the main one
+        # is Always, so after a tag bump the main container can run the new build while
+        # the init container runs a stale cached one against the same volume.
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        {{- with .Values.containerSecurityContext }}
+        securityContext:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        command: ['sh', '-c']
+        args:
+        - |
+          SECRET=$(tr -dc 'a-f0-9' < /dev/urandom | head -c 64)
+          cat > /etc/searxng/settings.yml <<SETTINGS
+          use_default_settings: true
+
+          engines:
+            - name: duckduckgo
+              disabled: true
+            - name: bing
+              disabled: false
+            # Google's HTML scraper is bot-blocked from this node and reports
+            # "Suspended: access denied" on every default query. Disabling sets
+            # enabled: false so it drops out of default queries; an explicit
+            # engines=google request still reaches it.
+            - name: google
+              disabled: true
+            - name: brave
+              disabled: true
+            - name: braveapi
+              inactive: false
+              api_key: "$BRAVE_API_KEY"
+
+          server:
+            secret_key: "$SECRET"
+            limiter: false
+            public_instance: false
+
+          search:
+            formats:
+              - html
+              - json
+
+          outgoing:
+            request_timeout: 15.0
+          SETTINGS
+        env:
+        - name: BRAVE_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ required "existingSecret is empty — the pre-created Secret that holds the Brave key (deploy/secret-init.sh)" .Values.existingSecret }}
+              key: brave-api-key
+              optional: true
+        volumeMounts:
+        - name: config
+          mountPath: /etc/searxng
+      containers:
+      - name: searxng
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        {{- with .Values.containerSecurityContext }}
+        securityContext:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        env:
+        {{- range $key, $val := .Values.env }}
+        - name: {{ $key }}
+          value: {{ $val | quote }}
+        {{- end }}
+        ports:
+        - name: http
+          containerPort: {{ .Values.service.port }}
+          protocol: TCP
+        volumeMounts:
+        - name: config
+          mountPath: /etc/searxng
+        # Without these the container is Ready the instant it starts, so the
+        # `kubectl rollout status deploy/...-searxng` gate in ../deploy.sh returns
+        # before SearXNG can answer a query, and a SearXNG that never binds 8080
+        # deploys as healthy. /healthz is SearXNG's own endpoint: it answers 200 "OK"
+        # when up and 404 on any other path, so it cannot pass vacuously.
+        # Same shape as the open-webui probes in ../../values.yaml.
+        {{- with .Values.startupProbe }}
+        startupProbe:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .Values.readinessProbe }}
+        readinessProbe:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .Values.livenessProbe }}
+        livenessProbe:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .Values.resources }}
+        resources:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      volumes:
+      - name: config
+        {{- if .Values.persistence.enabled }}
+        persistentVolumeClaim:
+          claimName: {{ include "searxng.fullname" . }}
+        {{- else }}
+        emptyDir: {}
+        {{- end }}

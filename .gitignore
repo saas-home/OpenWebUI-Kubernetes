@@ -1,0 +1,85 @@
+# ─────────────────────────────────────────────────────────────
+# Secrets — must never reach git
+# ─────────────────────────────────────────────────────────────
+# Site values for the deployment. Read by all deploy.sh scripts. Copy
+# .env.example (tracked) to .env and fill it in. No credential lives here:
+# credentials go into pre-created Kubernetes Secrets through
+# ./deploy/secret-init.sh.
+.env
+.env.*
+!.env.example
+
+# Legacy per-chart secret files; superseded by pre-created Kubernetes Secrets.
+# Still ignored so a leftover copy can never be committed.
+deploy/open-webui/values.secrets.yaml
+deploy/open-webui/values.secrets.*.yaml
+
+# secrets.manifest: HMAC fingerprints (salt + hash) of every Secret value,
+# written by deploy/secret-init.sh after a successful apply. Names, salts and
+# hashes only — never a value — but it is deploy-state, not source, so it is
+# untracked like .env. Deleting it is safe: secret-init.sh recreates it.
+secrets.manifest
+
+# Local, per-developer tool settings. Untracked by design; AGENTS.md
+# describes what the Claude one should contain.
+**/.claude/settings.local.json
+
+# Gemini CLI project config. Track only the AGENTS.md pointer, which is
+# what makes the CLI read this repo's instructions; ignore whatever else
+# the CLI writes beside it. The negated path must not be a directory.
+/.gemini/*
+!/.gemini/settings.json
+
+# Local environment overrides
+**/*.local.env
+
+# ─────────────────────────────────────────────────────────────
+# Helm build artifacts — regenerated on demand, never committed
+#   helm dependency build/update  -> charts/*.tgz, Chart.lock
+#   helm template ... > rendered.yaml
+# Regenerate with: cd deploy/open-webui && helm dependency build
+# Chart.lock is ignored because the repo carries exact version pins in
+# Chart.yaml instead; ./deploy.sh deletes the lock after building.
+# ─────────────────────────────────────────────────────────────
+**/charts/*.tgz
+**/Chart.lock
+**/rendered.yaml
+
+# ─────────────────────────────────────────────────────────────
+# Editors, OS, languages
+# ─────────────────────────────────────────────────────────────
+*.tmp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.vscode
+.idea
+
+# Stray environment stubs seen in this working tree: the sandbox bind-mounts
+# zero-byte read-only placeholders at these paths (a real $HOME dump, not
+# repo content). Nothing tracked here uses them, and the repo has no git
+# submodules, so /.gitmodules is junk too. Root-anchored so a legitimate
+# tracked file with the same name in a subdirectory is unaffected.
+/*.key
+/*.pem
+/.bash_profile
+/.bashrc
+/.profile
+/.zprofile
+/.zshrc
+/.gitconfig
+/.gitmodules
+/.ripgreprc
+/.mcp.json
+/.claude/agents
+/.claude/commands
+
+.ccache/
+__pycache__/
+*.pyc
+
+.venv/
+venv/
+env/

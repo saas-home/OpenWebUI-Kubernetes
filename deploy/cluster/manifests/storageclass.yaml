@@ -1,0 +1,24 @@
+# The StorageClass every PV and PVC in this repo names.
+#
+# It has to exist as an object even though nothing here is dynamically
+# provisioned: `./deploy/deploy.sh --check` and the README both ask you to
+# confirm it with `kubectl get storageclass`, and an absent object makes that
+# check unreadable. It was missing on this cluster for 239 days because static
+# binding succeeds on a matching name whether or not the object exists.
+#
+# `kubernetes.io/no-provisioner` is the deliberate choice. With the
+# rancher.io/local-path provisioner instead, a PVC that names local-storage but
+# has no matching PV would be silently satisfied with a directory under
+# /var/lib/rancher/k3s/storage -- on the wrong disk, outside every backup, and
+# Bound and Healthy so nothing looks wrong. With no-provisioner such a PVC stays
+# Pending, which is the loud failure you want.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-storage
+  labels:
+    app.kubernetes.io/name: openwebui-deployment
+    app.kubernetes.io/component: cluster-primitives
+provisioner: kubernetes.io/no-provisioner
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer

@@ -1,0 +1,23 @@
+{{- if .Values.extraDatabases }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "postgresql.fullname" . }}-init
+  labels:
+    {{- include "postgresql.labels" . | nindent 4 }}
+data:
+  {{- range $i, $db := .Values.extraDatabases }}
+  init-db-{{ $i }}.sh: |
+    #!/bin/bash
+    set -e
+    # Database: {{ $db.name }}
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" <<-EOSQL
+      DO \$\$ BEGIN
+        CREATE USER {{ $db.username | quote }} WITH PASSWORD {{ $db.password | quote }};
+      EXCEPTION WHEN duplicate_object THEN NULL;
+      END \$\$;
+      CREATE DATABASE {{ $db.name | quote }} OWNER {{ $db.username | quote }};
+      GRANT ALL PRIVILEGES ON DATABASE {{ $db.name | quote }} TO {{ $db.username | quote }};
+    EOSQL
+  {{- end }}
+{{- end }}

@@ -1,0 +1,70 @@
+# The Open WebUI file volume, created here rather than by the chart.
+#
+# The upstream open-webui chart is told to use an existing claim
+# (open-webui.persistence.existingClaim: open-webui in ../../open-webui/values.yaml),
+# so nothing in the chart creates this pair and a fresh cluster has no way to
+# reach Ready without it. Both objects are declared together because the PVC
+# pins itself to the PV by name: creating one without the other leaves the pod
+# Pending with no clue in the events.
+#
+# The PV is Retain and local, so `helm uninstall` and even deleting the PVC leave
+# the uploads and ChromaDB embeddings on disk. That is the point: this directory
+# holds the only copy of user documents.
+#
+# TEMPLATE — ./deploy/setup.sh substitutes the node name and the live data root
+# below and applies the result. Applying this file with kubectl instead leaves
+# unsubstituted tokens in the manifest: the PV matches no node, mounts no path,
+# and the PVC sits in Pending with events that do not mention why. To apply it
+# by hand, replace ${K3S_NODE_NAME} and ${LIVE_DATA_PATH} first.
+#
+# nodeAffinity must name the K3s node, which is the value of the
+# kubernetes.io/hostname label -- not necessarily what `hostname` prints on the
+# box. The field is immutable on a local PV: correcting it on a PV that is already
+# bound means deleting the PV, editing this file, and re-applying.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: open-webui-pv-local
+  labels:
+    app.kubernetes.io/name: openwebui-deployment
+    app.kubernetes.io/component: open-webui-storage
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-storage
+  volumeMode: Filesystem
+  local:
+    # The live data root comes from LIVE_DATA_PATH in .env (default
+    # ~/.open-webui/live-data); setup.sh renders it. This directory must match
+    # uploadsBackup.sourcePath in the open-webui chart, which the same root
+    # produces — the backup job tars exactly what this PV mounts.
+    path: ${LIVE_DATA_PATH}/open-webui
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - ${K3S_NODE_NAME}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: open-webui
+  namespace: default
+  labels:
+    app.kubernetes.io/name: openwebui-deployment
+    app.kubernetes.io/component: open-webui-storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: local-storage
+  volumeMode: Filesystem
+  volumeName: open-webui-pv-local

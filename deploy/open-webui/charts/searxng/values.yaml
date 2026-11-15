@@ -1,0 +1,88 @@
+image:
+  repository: searxng/searxng
+  tag: latest
+  pullPolicy: Always
+
+# Brave Search API key for the braveapi engine.
+# The key lives in the pre-created `ai-open-webui-searxng` Secret
+# (deploy/secret-init.sh) — encrypted at rest by K3s --secrets-encryption — and
+# this chart only references it by name. It never appears in a values file.
+# When the Secret does not exist (no Brave key), the secretKeyRef below is
+# optional and braveapi stays inactive.
+existingSecret: "ai-open-webui-searxng"
+
+replicaCount: 1
+
+service:
+  type: ClusterIP
+  port: 8080
+
+env:
+  PORT: "8080"
+  BIND_ADDRESS: "0.0.0.0"
+
+persistence:
+  enabled: true
+  storageClass: local-storage
+  size: 5Gi
+  accessMode: ReadWriteOnce
+  # Deliberately empty: the parent's deploy.sh injects <LIVE_DATA_PATH>/searxng
+  # from .env (default ~/.open-webui/live-data); templates/pv.yaml refuses to
+  # render without it. The parent chart overrides this key in its own values.
+  localPath: ""
+  # Supplied by the parent chart's deploy.sh from K3S_NODE_NAME in .env; see the
+  # note in deploy/postgresql/values.yaml. templates/pv.yaml will not render
+  # without it.
+  nodeName: ""
+
+resources: {}
+
+# Health probes. Without them the container reports Ready the instant it starts, so
+# the `kubectl rollout status deploy/...-searxng` gate in ../deploy.sh returns before
+# SearXNG can answer a query, and an instance that never binds 8080 deploys as healthy.
+# /healthz is the endpoint SearXNG ships for this: it answers 200 "OK" when up and 404
+# for any other path, so a probe on it cannot pass vacuously. The startup probe is the
+# cold-start budget (30 x 5s = 150s); the other two run only after it has passed.
+startupProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 30
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 6
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 6
+
+# SearXNG is the one component in this stack that pulls untrusted HTML off the
+# internet and feeds it to its parsers on this node, so it runs unprivileged.
+# 977 is the uid and gid of the `searxng` account inside searxng/searxng; the
+# host path deploy.sh creates (the searxng subdirectory of LIVE_DATA_PATH) is
+# owned by 977:977 by setup.sh, so the init
+# container can still rewrite settings.yml. runAsNonRoot is the part that does
+# real work: the kubelet refuses to start the pod if the image would run as
+# root, so a regression fails the rollout instead of quietly running as root.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 977
+  runAsGroup: 977
+  fsGroup: 977
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL

@@ -1,0 +1,359 @@
+{{- if .Values.backup.enabled }}
+{{- if not (regexMatch "^[0-9]+$" (.Values.backup.retentionCount | toString)) }}
+{{- fail "backup.retentionCount must be a plain integer (days of archives to keep)" }}
+{{- end }}
+{{- range $db := .Values.backup.databases }}
+{{- if not (regexMatch "^[A-Za-z_][A-Za-z0-9_]*$" $db) }}
+{{- fail (printf "backup.databases entry '%s' must be a plain database name (letters, digits, underscores)" $db) }}
+{{- end }}
+{{- end }}
+{{- if and .Values.backup.offDisk.enabled (not (regexMatch "^[0-9]+$" (.Values.backup.offDisk.retentionCount | toString))) }}
+{{- fail "backup.offDisk.retentionCount must be a plain integer (days of archives to keep)" }}
+{{- end }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "postgresql.fullname" . }}-backup
+  labels:
+    {{- include "postgresql.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # A CronJob with no deadline is *skipped*, not deferred, when the node is down or the
+  # API server is unreachable at the scheduled minute: the only trace is a transient
+  # event, and `kubectl get jobs` goes on looking healthy while the newest archive ages
+  # past the retention window. A deadline makes a late start still run the job.
+  startingDeadlineSeconds: {{ .Values.backup.startingDeadlineSeconds | default 3600 }}
+  jobTemplate:
+    spec:
+      # Each failed attempt retries in place and re-dumps every database, so a
+      # persistent fault writes a fresh set of archives per retry. One retry still
+      # covers a transient fault without a dozen 12 MB files appearing from a
+      # single broken night.
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            # Deliberately NOT postgresql.selectorLabels. That pair is the Service's
+            # selector, so a job pod carrying it joins the postgres Service endpoints
+            # for the length of every backup -- and with no readinessProbe on this
+            # container it counts as Ready while it runs. Clients hitting
+            # postgres:5432 during the nightly dump would then be load-balanced onto a
+            # pod with nothing listening and get connection refused.
+            app.kubernetes.io/name: {{ include "postgresql.name" . }}-backup
+            app.kubernetes.io/instance: {{ .Release.Name }}
+            app.kubernetes.io/component: backup
+        spec:
+          restartPolicy: OnFailure
+          {{- with .Values.backup.podSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+          - name: backup
+            image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+            command: ['sh', '-c']
+            args:
+            - |
+              # pipefail is load-bearing here. pg_dump's exit status is hidden behind
+              # the pipe, so with plain `set -e` a failed dump still returns gzip's
+              # success: the job reports success, writes an empty archive, and the
+              # retention block then deletes a good backup to make room for it.
+              set -euo pipefail
+
+              # /bin/sh in this image is busybox ash, which supports both pipefail --
+              # the dump's exit status depends on it -- and `local`. Lint this script
+              # with `shellcheck --shell=bash`: under --shell=sh those two report
+              # SC3040/SC3043 as undefined even though the runtime has them.
+
+              BACKUP_DIR="/backups"
+              TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+              PG_SVC="{{ include "postgresql.fullname" . }}"
+              # PG_USER, the scratch database name and the retention budgets arrive
+              # as container env vars, not interpolated into this script: every
+              # values-derived string goes through env, so a hand-edited .env value
+              # carrying $( ) or a quote stays data, never code.
+              FAILED=""
+
+              # psql reads PGPASSWORD, not POSTGRES_PASSWORD, so the Secret's key has
+              # to be re-exported or every psql call falls back to prompting and dies
+              # on a job with no tty. Fail here rather than midway through a run.
+              if [ -z "${POSTGRES_PASSWORD:-}" ]; then
+                echo "ERROR: POSTGRES_PASSWORD is empty; the postgres Secret is missing its password key." >&2
+                exit 1
+              fi
+              export PGPASSWORD="$POSTGRES_PASSWORD"
+
+              # Every statement goes over the Service FQDN, never a local socket:
+              # pg_hba.conf grants trust to 127.0.0.1/32, so a loopback psql accepts
+              # any password and a broken credential would read as success.
+              # $1 = database, $2 = SQL, output is tuples-only.
+              psql_admin() {
+                psql -h "$PG_SVC" -U "$PG_USER" -d "$1" -v ON_ERROR_STOP=1 -tA -c "$2"
+              }
+
+              # Human-readable size from the byte count. `du` reads allocated blocks,
+              # which ZFS leaves near zero until the transaction group commits, so du
+              # reported 512 for a freshly copied 12 MB archive on the second disk.
+              size_h() {
+                local b
+                b=$(( $(wc -c < "$1") ))
+                if [ "$b" -ge 1048576 ]; then
+                  echo "$((b / 1048576))M"
+                elif [ "$b" -ge 1024 ]; then
+                  echo "$((b / 1024))K"
+                else
+                  echo "${b}B"
+                fi
+              }
+
+              # Object inventory of the public schema, as one comparable string. A
+              # gzip -t pass proves the archive is intact; it does not prove the dump
+              # contains anything, which is what an empty archive taught us.
+              inventory() {
+                psql_admin "$1" \
+                  "select coalesce(md5(string_agg(tablename, ',' order by tablename)),'-') || '/' || count(*) from pg_tables where schemaname='public'"
+              }
+
+              # Restore the archive into a scratch database and compare the result
+              # against the live one. This is the step that turns "we have backups"
+              # into "we have a restore": an unreadable or truncated dump now fails
+              # the job on the night it happens instead of on the day it is needed.
+              restore_check() {
+                local db file want scratch got
+                db="$1"
+                file="$2"
+                want="$3"
+                scratch="$BACKUP_VERIFY_DB"
+
+                if ! psql_admin postgres "DROP DATABASE IF EXISTS ${scratch} WITH (FORCE)" >/dev/null; then
+                  echo "ERROR: could not drop the previous ${scratch} database." >&2
+                  return 1
+                fi
+                if ! psql_admin postgres "CREATE DATABASE ${scratch} OWNER ${PG_USER}" >/dev/null; then
+                  echo "ERROR: could not create the ${scratch} verification database." >&2
+                  return 1
+                fi
+                # The archive was written with --clean --if-exists, so it carries its
+                # own DROP TABLE IF EXISTS and needs no pre-cleanup. ON_ERROR_STOP
+                # makes psql exit non-zero on the first failing statement; without it
+                # psql reports errors on stderr and still returns success.
+                if ! zcat "$file" \
+                  | psql -h "$PG_SVC" -U "$PG_USER" -d "$scratch" -v ON_ERROR_STOP=1 -q >/dev/null; then
+                  psql_admin postgres "DROP DATABASE IF EXISTS ${scratch} WITH (FORCE)" >/dev/null || true
+                  echo "ERROR: restoring ${file} into ${scratch} failed." >&2
+                  return 1
+                fi
+                got=$(psql_admin "$scratch" \
+                  "select coalesce(md5(string_agg(tablename, ',' order by tablename)),'-') || '/' || count(*) from pg_tables where schemaname='public'")
+                if ! psql_admin postgres "DROP DATABASE IF EXISTS ${scratch} WITH (FORCE)" >/dev/null; then
+                  echo "WARNING: restored ${scratch} could not be dropped; it will be replaced on the next run." >&2
+                fi
+                if [ "$got" != "$want" ]; then
+                  echo "ERROR: ${scratch} does not match ${db}: got '${got}', expected '${want}'." >&2
+                  return 1
+                fi
+                echo "Restore verified: ${db} -> ${scratch} (${got})"
+                return 0
+              }
+
+              # Keep the newest N distinct DAYS, counting a day once however many
+              # archives carry it. Counting files instead made retentionCount a
+              # file budget: three hand-run jobs in one morning evicted a whole week
+              # of nightly archives and left the RPO at a few hours.
+              # $1 = dir, $2 = filename prefix, $3 = days to keep
+              prune() {
+                local dir prefix keep keep_days f day removed
+                dir="$1"
+                prefix="$2"
+                keep="$3"
+                [ -d "$dir" ] || return 0
+                # Drop any archive that fails the same two checks the write path
+                # applies. An empty dump is not a backup, so it should not occupy a
+                # retention slot: the 20-byte file an authentication failure once
+                # wrote would otherwise sit in the window for the whole retention
+                # period and read as a restore point that does not exist.
+                for f in "${dir}/${prefix}"_*.sql.gz; do
+                  [ -e "$f" ] || continue
+                  if ! gzip -t "$f" 2>/dev/null \
+                    || ! zcat "$f" | grep 'PostgreSQL database dump complete' >/dev/null; then
+                    rm -f "$f"
+                    echo "Removed unverifiable archive: $f"
+                  fi
+                done
+                # `ls` is safe here because the keep_days pipeline tolerates no match
+                # via `|| true`; the removal loop below skips a glob that matched
+                # nothing with the [ -e ] test.
+                keep_days=$(ls -1t "${dir}/${prefix}"_*.sql.gz 2>/dev/null \
+                  | sed -E "s#.*/${prefix}_([0-9]{8})_[0-9]{6}\.sql\.gz\$#\1#" \
+                  | awk -v k="$keep" '!seen[$0]++ && ++i <= k {print}' || true)
+                [ -n "$keep_days" ] || return 0
+                removed=0
+                for f in "${dir}/${prefix}"_*.sql.gz; do
+                  [ -e "$f" ] || continue
+                  day=$(basename "$f" | sed -E "s/^${prefix}_([0-9]{8})_[0-9]{6}\.sql\.gz\$/\1/")
+                  if ! printf '%s\n' "$keep_days" | grep -qx "$day"; then
+                    rm -f "$f"
+                    removed=$((removed + 1))
+                  fi
+                done
+                if [ "$removed" -gt 0 ]; then
+                  echo "Rotated ${prefix}: removed ${removed} archive(s) outside the newest ${keep} day(s)"
+                fi
+                return 0
+              }
+
+              # Copy to the second disk only after the copy itself passes gzip -t,
+              # and land it through a rename so a half-written file can never be the
+              # newest archive anyone finds. The first-copy directory sits on the
+              # same device as the data, so one device failure loses both.
+              copy_offdisk() {
+                local file dest_dir dest
+                file="$1"
+                dest_dir="$2"
+                dest="${dest_dir}/$(basename "$file")"
+                # The directory may pre-exist, owned by the operator (setup.sh
+                # creates it; a no-sudo bootstrap leaves it user-owned). A
+                # non-root job cannot chmod a directory it does not own, so
+                # create it with 0755 only when missing; never re-chmod an
+                # existing one.
+                [ -d "$dest_dir" ] || install -d -m 0755 "$dest_dir" || return 1
+                if ! cp -f "$file" "${dest}.part"; then
+                  rm -f "${dest}.part"
+                  echo "ERROR: copy to ${dest} failed." >&2
+                  return 1
+                fi
+                if ! gzip -t "${dest}.part"; then
+                  rm -f "${dest}.part"
+                  echo "ERROR: ${dest}.part is not a valid gzip archive." >&2
+                  return 1
+                fi
+                if ! mv -f "${dest}.part" "$dest"; then
+                  rm -f "${dest}.part"
+                  echo "ERROR: could not move the verified copy into place at ${dest}." >&2
+                  return 1
+                fi
+                echo "Second-disk copy: ${dest} ($(size_h "$dest"))"
+                return 0
+              }
+
+              backup_one() {
+                local db file want
+                db="$1"
+                file="${BACKUP_DIR}/${db}_${TIMESTAMP}.sql.gz"
+
+                echo "Starting ${db} dump at $(date)"
+
+                # Read the inventory BEFORE the dump. pg_dump takes one consistent
+                # snapshot at start, so the snapshot can only ever match the inventory
+                # taken at that same point. Reading it afterwards meant any CREATE or
+                # DROP TABLE landing during the dump made the restored scratch database
+                # disagree with the live one, and the nightly job reported a failed
+                # backup on a night the backup was actually fine.
+                want=$(inventory "$db") || return 1
+
+                if ! pg_dump \
+                  -h "$PG_SVC" \
+                  -U "$PG_USER" \
+                  -d "$db" \
+                  --clean --if-exists \
+                  | gzip > "${file}"; then
+                  rm -f "${file}"
+                  echo "ERROR: pg_dump failed for ${db}; no backup written." >&2
+                  return 1
+                fi
+
+                # pg_dump writes that trailer only after the whole dump completes, so
+                # it proves the archive is complete. gzip -t on its own would accept
+                # the 20-byte empty archive that an authentication failure produces.
+                # grep reads the stream to EOF: `grep -q` would exit on the first
+                # match, and the SIGPIPE that then kills zcat would read as a failure
+                # under pipefail and delete a good archive.
+                if ! gzip -t "${file}" \
+                  || ! zcat "${file}" | grep 'PostgreSQL database dump complete' >/dev/null; then
+                  rm -f "${file}"
+                  echo "ERROR: ${file} is not a complete pg_dump archive." >&2
+                  return 1
+                fi
+
+                echo "Backup created: ${file} ($(size_h "${file}"))"
+
+                restore_check "$db" "$file" "$want" || return 1
+
+                {{- if .Values.backup.offDisk.enabled }}
+                copy_offdisk "$file" "$OFFDISK_DIR" || return 1
+                prune "$OFFDISK_DIR" "$db" "$OFFDISK_RETENTION" || return 1
+                {{- end }}
+                prune "$BACKUP_DIR" "$db" "$BACKUP_RETENTION" || return 1
+                return 0
+              }
+
+              for db in{{ range .Values.backup.databases }} {{ . | quote }}{{ end }}; do
+                if ! backup_one "$db"; then
+                  echo "ERROR: backup of ${db} failed; continuing with the remaining databases." >&2
+                  FAILED="${FAILED} ${db}"
+                fi
+              done
+
+              echo
+              echo "Backup complete at $(date)"
+              # `|| true` on both listings: under `set -e` an empty backup directory makes
+              # `ls` exit non-zero and kills the job here, which is before the FAILED
+              # summary below -- so the one night with nothing to show for it printed no
+              # list of which databases had failed. The FAILED check is the real gate.
+              ls -lh "${BACKUP_DIR}"/*.sql.gz || true
+              {{- if .Values.backup.offDisk.enabled }}
+              ls -lh "$OFFDISK_DIR"/*.sql.gz || true
+              {{- end }}
+
+              if [ -n "$FAILED" ]; then
+                echo "ERROR: these databases did not complete backup+verify:${FAILED}" >&2
+                exit 1
+              fi
+            env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "auth.existingSecret is empty — the pre-created Secret that holds the DB password (deploy/secret-init.sh)" .Values.auth.existingSecret }}
+                  key: password
+            # Everything the script body takes from values arrives as env, never
+            # interpolated into sh -c: .env is hand-edited (README documents it)
+            # and a username or path holding $( ) must stay data. The deploy
+            # script whitelists the character classes on top of this.
+            - name: PG_USER
+              value: {{ required "auth.username is empty — run ./deploy.sh (it injects it from POSTGRES_USER in .env)" .Values.auth.username | quote }}
+            - name: BACKUP_VERIFY_DB
+              value: {{ .Values.backup.verify.scratchDatabase | quote }}
+            - name: BACKUP_RETENTION
+              value: {{ .Values.backup.retentionCount | quote }}
+            {{- if .Values.backup.offDisk.enabled }}
+            - name: OFFDISK_DIR
+              value: {{ required "backup.offDisk.hostPath is empty — run ./deploy.sh (it injects it from BACKUP_DATA_PATH in .env)" .Values.backup.offDisk.hostPath | quote }}
+            - name: OFFDISK_RETENTION
+              value: {{ .Values.backup.offDisk.retentionCount | quote }}
+            {{- end }}
+            {{- with .Values.backup.resources }}
+            resources:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+            volumeMounts:
+            - name: backups
+              mountPath: /backups
+            {{- if .Values.backup.offDisk.enabled }}
+            - name: backups-offdisk
+              mountPath: {{ required "backup.offDisk.hostPath is empty — run ./deploy.sh (it injects it from BACKUP_DATA_PATH in .env)" .Values.backup.offDisk.hostPath | quote }}
+            {{- end }}
+          volumes:
+          - name: backups
+            hostPath:
+              path: {{ required "backup.hostPath is empty — run ./deploy.sh (it injects it from LIVE_DATA_PATH in .env)" .Values.backup.hostPath | quote }}
+              type: DirectoryOrCreate
+          {{- if .Values.backup.offDisk.enabled }}
+          - name: backups-offdisk
+            hostPath:
+              path: {{ required "backup.offDisk.hostPath is empty — run ./deploy.sh (it injects it from BACKUP_DATA_PATH in .env)" .Values.backup.offDisk.hostPath | quote }}
+              type: DirectoryOrCreate
+          {{- end }}
+{{- end }}

@@ -1,0 +1,482 @@
+# ──────────────────────────────────────
+# SearXNG subchart values
+# ──────────────────────────────────────
+searxng:
+  image:
+    repository: searxng/searxng
+    tag: "2026.11.12-de722ab1b"
+    pullPolicy: Always
+  replicaCount: 1
+
+  # SearXNG parses untrusted HTML and fans a single query out to several engines
+  # at once, so it is CPU-bound in bursts. These are the `small` profile's values;
+  # ./deploy.sh renders them from MESSAGE_SCALE, so this block is what a bare
+  # `helm template` gets. It does not grow with stored messages — the search proxy
+  # never touches the database — which is why the profile barely moves it.
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "1Gi"
+
+  service:
+    type: ClusterIP
+    port: 8080
+  env:
+    PORT: "8080"
+    BIND_ADDRESS: "0.0.0.0"
+  persistence:
+    enabled: true
+    storageClass: local-storage
+    size: 5Gi
+    accessMode: ReadWriteOnce
+    # Deliberately empty: the data root is site-specific, so it lives in
+    # LIVE_DATA_PATH in .env (default ~/.open-webui/live-data) and
+    # ./deploy.sh injects <root>/searxng here. templates/pv.yaml refuses to
+    # render without it.
+    localPath: ""
+    # Supplied by ./deploy.sh from K3S_NODE_NAME in .env, along with the same key
+    # in the Postgres chart. templates/pv.yaml will not render without it.
+    nodeName: ""
+
+# ──────────────────────────────────────
+# Open WebUI subchart values
+# ──────────────────────────────────────
+open-webui:
+  # Specify Open WebUI version (app version, not Helm chart version)
+  image:
+    tag: "v0.13.3"
+
+  # The upstream chart's built-in init container (copy-app-data — it copies the
+  # image's /app/backend/data onto the PVC) doubles as the pip prewarmer. It
+  # runs the SAME app image with the SAME data PVC mounted at /tmp/app-data,
+  # so installing there means the main container finds the packages under
+  # /app/backend/data/pip-extras (PIP_TARGET / PYTHONPATH in extraEnvVars
+  # below). The chart renders this command verbatim (no templating), so the
+  # preload list lives literally in the script: add the exact pip package
+  # names when the app log complains about one for a file type you need.
+  # Keep the list small and never list a package the image already ships —
+  # PYTHONPATH entries shadow the bundled site-packages, and preinstalling a
+  # bundled package at a different version overrides the tested pin.
+  # The cp line replicates the chart's current default command exactly; if a
+  # chart bump changes that default, change this line with it. The pip step is
+  # best-effort (|| true): a failed prewarm must never block the app, the
+  # runtime installer remains the fallback.
+  copyAppData:
+    command:
+      - sh
+      - -c
+      - |
+        cp -R -n /app/backend/data/* /tmp/app-data/
+        PKGS=""
+        [ -n "$PKGS" ] || exit 0
+        PY=/app/backend/venv/bin/python
+        [ -x "$PY" ] || PY=python3
+        "$PY" -m pip install --no-cache-dir --target /tmp/app-data/pip-extras $PKGS || true
+
+  # Replica count for concurrent request handling
+  replicaCount: 1
+
+  # Health probes. The upstream chart ships all three as {} (disabled), which makes
+  # the pod report 1/1 Running the moment the container starts -- including while
+  # alembic is still applying migrations with nothing listening. With them enabled,
+  # `kubectl rollout status` actually waits for a serving pod.
+  #
+  # The startup probe gates the other two, so its failureThreshold is the migration
+  # budget: 60 x 10s = 10 minutes before the container is restarted.
+  startupProbe:
+    httpGet:
+      path: /health
+      port: http
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 60
+
+  readinessProbe:
+    httpGet:
+      path: /health/db
+      port: http
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: http
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+  # WebSocket broker image. The bundled chart pins an older 7.4-line alpine
+  # itself; this override keeps the broker on the current stable major. Verify
+  # both sides at any audit time:
+  #   helm show values charts/open-webui-*.tgz | grep -A2 'redis:'
+  #   curl -s "https://hub.docker.com/v2/repositories/library/redis/tags?page_size=100&ordering=last_updated"
+  # Change only the tag here when bumping; the alpine suffix tracks the base.
+  websocket:
+    redis:
+      image:
+        tag: "8.10.3-alpine3.23"
+      # The broker held no requests or limits at all, so the scheduler could not
+      # reason about it and it could burst into any spare capacity. These are the
+      # `small` profile's values; ./deploy.sh renders them from MESSAGE_SCALE.
+      resources:
+        requests:
+          cpu: "50m"
+          memory: "64Mi"
+        limits:
+          cpu: "200m"
+          memory: "256Mi"
+
+  # CPU & memory resources — the `small` message-scale profile.
+  #
+  # ./deploy.sh renders these from MESSAGE_SCALE in .env, so this block is what a
+  # bare `helm template` gets, not what a deploy writes. The profile table lives
+  # in deploy/open-webui/deploy.sh, with an identical copy in the postgres script;
+  # edit it there, not here. One uvicorn worker costs about 700 MB of unique pages
+  # (the embedding model and torch libraries are shared), so 4 GiB carries three
+  # workers plus room for an ingestion burst.
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "2560Mi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+
+  # Migrations run here, once, before any worker starts. The app runs them at
+  # import time with no advisory lock, so N workers would race on a fresh
+  # database and after every image bump; ENABLE_DB_MIGRATIONS is false in
+  # extraEnvVars below so this is the only place they run. The chart renders
+  # this list verbatim (no templating), so the image tag is literal and must
+  # track open-webui.image.tag — selftest.sh enforces that they match.
+  extraInitContainers:
+    - name: db-migrate
+      image: ghcr.io/open-webui/open-webui:v0.13.3
+      imagePullPolicy: IfNotPresent
+      command:
+        - python3
+        - -c
+        - "from open_webui.config import run_migrations; run_migrations()"
+      env:
+        - name: ENABLE_DB_MIGRATIONS
+          value: "false"
+      envFrom:
+        - secretRef:
+            name: ai-open-webui-secrets
+      # The app's config import creates the OPEN_WEBUI_DIR subdirectories
+      # (uploads/, static/, ...) at import time. Without this mount the
+      # container runs on the image-layer /app/backend/data, which is root-owned
+      # and not writable by the pod's uid, and the import dies with
+      # PermissionError before a single migration runs.
+      volumeMounts:
+        - name: data
+          mountPath: /app/backend/data
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+
+  extraEnvVars:
+    # Every name here must be read by the pinned image. Verify after any edit, and
+    # especially after an image bump, by grepping the running container's own source:
+    #   kubectl exec -n default statefulset/ai-open-webui -c open-webui -- \
+    #     grep -rn "NAME" /app/backend/open_webui --include=*.py
+    # A name the app never reads is not inert: Open WebUI reads env vars only to seed
+    # its config table on a fresh database, so a wrong name silently changes what a
+    # restore or a new node comes up with. Thirteen entries here were exactly that, and
+    # their comments described protection that was never in effect.
+
+    # ===== Concurrency and database pooling =====
+    # UVICORN_WORKERS, DATABASE_POOL_SIZE and DATABASE_POOL_MAX_OVERFLOW are NOT
+    # here: they are part of the message-scale envelope, so ./deploy.sh renders
+    # them into commonEnvVars from the profile table (workers, pool size and
+    # overflow all move with MESSAGE_SCALE). Listing them here as well would
+    # produce a duplicate env name, which the API server rejects.
+    #
+    # The relationships they encode, kept here because they are the reason the
+    # profile moves them together:
+    #   - one pool PER worker, so the connection ceiling is
+    #     workers x (size + overflow), and the postgres profile's max_connections
+    #     must stay above it (3x20 of 100, 5x20 of 150, 8x20 of 200).
+    #   - the image entrypoint hardcodes --workers 1, but start.sh reads
+    #     UVICORN_WORKERS when no CLI args are passed (the chart passes none), so
+    #     that name is the switch that actually works.
+    #   - Redis is the socket.io broker, which is what makes websocket fan-out
+    #     correct across workers.
+    # Per-message websocket deflate is CPU-bound on token-sized frames; the app
+    # source says as much. The hop to the browser is LAN or a reverse proxy that
+    # compresses anyway, so this trades a little bandwidth for less CPU per token.
+    - name: UVICORN_WS_PER_MESSAGE_DEFLATE
+      value: "false"
+    # 500 was sized for one worker. Four workers x 500 = 2000 possible thread
+    # stacks; 128 x 4 = 512 is still far more than this app needs.
+    - name: THREAD_POOL_SIZE
+      value: "128"
+    # Migrations run once in the db-migrate init container (extraInitContainers
+    # below). The app runs them at import time with no advisory lock, so four
+    # workers would race on a fresh database and after every image bump.
+    - name: ENABLE_DB_MIGRATIONS
+      value: "false"
+
+    # ===== CRITICAL: AIOHTTP Client Timeouts =====
+    # Must be set explicitly to prevent 504 Gateway Timeout errors
+    # Set to 30 minutes (1800s) for ultra-long generations
+    - name: AIOHTTP_CLIENT_TIMEOUT
+      value: "1800"  # 30 minutes for long generations
+    - name: AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST
+      value: "10"   # 10 seconds for model list fetching
+
+    # ===== CRITICAL: Disable Realtime Chat Save =====
+    # MUST be false in production - causes severe performance degradation
+    # Enabling this causes database connection exhaustion and 10-50x slowdown
+    - name: ENABLE_REALTIME_CHAT_SAVE
+      value: "false"
+
+    # ===== Runtime pip: persist loader installs onto the PVC =====
+    # Document loaders the image lacks are pip-installed at first use. By
+    # default that lands in the container layer and evaporates on every pod
+    # restart; these two vars redirect pip onto the data PVC instead, so a
+    # package installs once ever and the re-download tax after each rollout is
+    # gone. The init container in copyAppData (above) prewarms from the same
+    # path. Keep all three /app/backend/data/pip-extras references — these two
+    # and the init container's TARGET — in sync; selftest.sh enforces these
+    # two match each other.
+    - name: PIP_TARGET
+      value: /app/backend/data/pip-extras
+    - name: PYTHONPATH
+      value: /app/backend/data/pip-extras
+
+    # ===== Removed names: never read by the app =====
+    # These names used to sit in this list with confident comments and were never read by
+    # the pinned image: OPENAI_API_REQUEST_TIMEOUT, OPENAI_API_CONNECT_TIMEOUT,
+    # REQUEST_TIMEOUT, ENABLE_STREAMING, STREAMING_TIMEOUT, ENABLE_RESPONSE_CACHE,
+    # RESPONSE_CACHE_TTL, CACHE_SIZE_MB, ENABLE_GZIP_COMPRESSION, COMPRESS_MINIMUM_SIZE,
+    # OPENAI_API_POOL_SIZE, WEBUI_PROXY_HEADERS, ENABLE_API_KEY_GENERATION. Streaming was
+    # never switched off by the first two, nothing was ever cached by the next three, and
+    # no app-level gzip existed. What does apply: AIOHTTP_CLIENT_TIMEOUT above bounds a
+    # generation, and AIOHTTP_POOL_CONNECTIONS below reuses connections to the inference
+    # host. Do not re-add a name from this list without grepping the image for it first.
+
+    # ===== File Upload (Knowledge/RAG) =====
+    # Read from Open WebUI's own config.py by the pinned image tag.
+    - name: USER_PERMISSIONS_CHAT_FILE_UPLOAD
+      value: "true"
+    - name: USER_PERMISSIONS_CHAT_WEB_UPLOAD
+      value: "true"
+    - name: STORAGE_PROVIDER
+      value: "local"
+
+    # ===== Connection Pooling =====
+    # Reuse HTTP connections to the inference host. The app reads this one under the
+    # AIOHTTP_ name; the OPENAI_API_POOL_* pair that used to sit here was never read, and
+    # no pool-size setting exists in the app at all.
+    - name: AIOHTTP_POOL_CONNECTIONS
+      value: "10"
+
+    # ===== RAG Embedding =====
+    # In-process sentence-transformers (default all-MiniLM-L6-v2). No external
+    # embedding API is currently provisioned; ~500MB RAM cost per worker.
+    - name: RAG_EMBEDDING_ENGINE
+      value: ""
+    # The app default is 1, i.e. one chunk embedded per forward pass. Ingestion is
+    # the CPU-bound local task (the model call is remote), and batching is the
+    # single biggest win there. This name seeds a fresh database only: the config
+    # row rag.embedding_batch_size wins on a running one, so the row must match
+    # (see the deploy note in AGENTS.md).
+    - name: RAG_EMBEDDING_BATCH_SIZE
+      value: "32"
+    # The in-process embedding model is NOT baked into the image: it downloads on
+    # first use into the Hugging Face cache. The pod runs as the deploying user
+    # (podSecurityContext injected by deploy.sh), so the default cache under
+    # root's home is not writable and the first RAG request would fail. Pinning
+    # it under the data volume keeps it writable by that user, persists it across
+    # pod rebuilds, and puts it inside the uploads backup.
+    - name: HF_HOME
+      value: "/app/backend/data/hf-cache"
+    - name: HOME
+      value: "/app/backend/data/home"
+
+    # ===== Existing Configuration =====
+    # The web search trio below carries the web.search.* config namespace. It used to be
+    # spelled ENABLE_RAG_WEB_SEARCH, RAG_WEB_SEARCH_ENGINE and
+    # RAG_WEB_SEARCH_RESULT_COUNT; the app reads these names without the RAG_ prefix, so
+    # the old spellings seeded nothing. That was not cosmetic: ENABLE_WEB_SEARCH defaults
+    # to False in the app, so a restored or brand new database came back with web search
+    # silently off. Check any name here against the running container before trusting it:
+    #   kubectl exec -n default statefulset/ai-open-webui -c open-webui -- \
+    #     grep -rn "NAME" /app/backend/open_webui --include=*.py
+    # These are the seed for a FRESH database. The config table already holds these rows
+    # and ENABLE_PERSISTENT_CONFIG lets the table win, so read the rows (select key,
+    # value from config where key like 'web.search.%') to see what is actually running.
+    - name: ENABLE_WEB_SEARCH
+      value: "true"
+    - name: WEB_SEARCH_RESULT_COUNT
+      value: "1"
+    - name: BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL
+      value: "true"
+    - name: WEB_SEARCH_ENGINE
+      value: "searxng"
+
+    # ===== Latency: web-page loading (kept bypassed) =====
+    # Measured on this stack: when web search runs for a message it cost 0.86s for the
+    # SearXNG query plus 1.55s to fetch all 5 result pages (3.8 MB of HTML, fetched
+    # sequentially because web.search.concurrent_requests is 0), and that HTML was then
+    # embedded in-process before the model was asked anything. Both bypasses are on, so a
+    # searched message uses the SearXNG snippets instead. They only pay off on messages
+    # where web search actually fires; on a message with search off they save nothing.
+    # These are the seed for a FRESH database; the config table wins once rows exist
+    # (ENABLE_PERSISTENT_CONFIG), so change them in Admin > Settings on a running system.
+    - name: BYPASS_WEB_SEARCH_WEB_LOADER
+      value: "true"
+
+    # ===== Background LLM tasks: considered as a latency fix, then kept ON =====
+    # These three are app defaults that were never declared here. They were switched off
+    # once while chasing a ~7s delay to the first character, and a captured request
+    # timeline showed that was the wrong target: title, tags and follow-up generation all
+    # run AFTER the answer completes, so they never delay the first token. What they cost
+    # is one extra generation each, after the reply, which only matters when the inference
+    # host is already busy. The delay in that trace came from the model's own reasoning
+    # phase, not from these.
+    # They stay on because this deployment uses them: 502 of 566 chats carry a generated
+    # title and 426 carry generated tags in chat.meta.tags. Set explicitly true rather
+    # than omitted so the decision and its evidence are recorded here, and a fresh install
+    # matches a running one. Note chatidtag is an unused legacy table; tags live
+    # in chat.meta.tags, so counting chatidtag rows reports 0 and means nothing.
+    - name: ENABLE_TITLE_GENERATION
+      value: "true"
+    - name: ENABLE_TAGS_GENERATION
+      value: "true"
+    - name: ENABLE_FOLLOW_UP_GENERATION
+      value: "false"
+    - name: SEARXNG_QUERY_URL
+      value: "http://ai-open-webui-searxng.default.svc.cluster.local:8080/search?q=<query>"
+    # WEBUI_URL, ENABLE_LOGIN_FORM and the cookie flags are deliberately absent.
+    # They depend on .env (the public hostname) and on whether Google SSO is
+    # configured, and Helm replaces a list rather than merging into it — so
+    # ./deploy.sh renders them into commonEnvVars instead. The names must not
+    # appear here as well: a duplicate env name fails at the API server.
+    - name: ENABLE_OAUTH_SIGNUP
+      value: "true"
+    - name: DEFAULT_USER_ROLE
+      value: "pending"
+    - name: ENV
+      value: "prod"
+    - name: OPENID_PROVIDER_URL
+      value: "https://accounts.google.com"
+    - name: RAG_TOP_K
+      value: "3"
+    - name: ENABLE_PERSISTENT_CONFIG
+      value: "true"
+    - name: RESET_CONFIG_ON_START
+      value: "false"
+
+  # Two settings name machines outside the cluster — the public hostname and the
+  # inference endpoint — so neither is written here. ./deploy.sh reads them from
+  # .env and passes them in a 0600 temp values file:
+  #
+  #   OPENAI_API_BASE_URL -> openaiBaseApiUrl  (the chart leaves it at
+  #       api.openai.com, which is the wrong default for a self-hosted stack, so
+  #       it is pinned empty here and only ever filled from .env)
+  #   WEBUI_URL           -> commonEnvVars      (the public URL the app puts in
+  #       OAuth and email links; deploy.sh also renders ENABLE_LOGIN_FORM and
+  #       the cookie flags into the same list — see the note in extraEnvVars)
+  #
+  # WEBUI_URL arrives through commonEnvVars rather than extraEnvVars because Helm
+  # replaces a list instead of merging it, so a single injected entry would erase
+  # the list above. The upstream chart only emits its own WEBUI_URL when ingress
+  # or an OpenShift route is enabled; both are off here, so the container gets
+  # exactly one. Enabling either alongside WEBUI_URL in .env produces a duplicate
+  # env name that the API server rejects.
+  #
+  # With ENABLE_PERSISTENT_CONFIG "true", the app's own config table can shadow
+  # openaiBaseApiUrl once the admin has saved endpoint settings in the UI. Read
+  # `select value from config where key = 'openai.api_base_urls'` to see what the
+  # running app actually uses.
+  openaiBaseApiUrl: ""
+
+  service:
+    type: NodePort
+    port: 80
+    containerPort: 8080
+    nodePort: 30000
+
+  persistence:
+    enabled: true
+    existingClaim: "open-webui"
+    size: 10Gi
+    storageClass: "local-storage"
+    accessModes:
+      - ReadWriteOnce
+
+  # Disable unused subcharts for cleaner deployment
+  ollama:
+    enabled: false
+
+  pipelines:
+    enabled: false
+
+  # Credentials arrive from the Secret created by templates/secret.yaml, never from
+  # this file. That Secret is filled from the gitignored .env at the repo root by
+  # ./deploy.sh. Keys provided: WEBUI_SECRET_KEY, GOOGLE_CLIENT_ID,
+  # GOOGLE_CLIENT_SECRET, DATABASE_URL.
+  #
+  # The Secret itself is pre-created by deploy/secret-init.sh and is NOT part of
+  # this release: helm cannot rewrite or delete it on an upgrade, and
+  # `helm get manifest` no longer prints the values. A missing Secret still fails
+  # loudly with CreateContainerConfigError; ./deploy.sh checks for it before helm
+  # and points at secret-init.sh instead of a cryptic pod error.
+  extraEnvFrom:
+    - secretRef:
+        name: ai-open-webui-secrets
+
+# ──────────────────────────────────────
+# Uploads volume backup
+# ──────────────────────────────────────
+# The file volume behind the pre-created `open-webui` PVC. uploads/ holds the
+# documents and images users submitted and vector_db/ holds their ChromaDB
+# embeddings — the only copies of both, and outside the reach of the Postgres
+# CronJob, which dumps databases only. sourcePath and hostPath are injected by
+# ./deploy.sh from LIVE_DATA_PATH and BACKUP_DATA_PATH in .env; the templates
+# refuse to render without them. Production recommendation: keep the backup
+# root on a different device than the volume it archives.
+uploadsBackup:
+  enabled: true
+  # 02:30 UTC, after the 02:00 database dumps, so the two do not compete for the
+  # same disk during the archive.
+  schedule: "30 2 * * *"
+  # Days of archives to keep, counted by distinct day. Measured at 1.4 GB each, so 4 days
+  # is about 6 GB on a pool with ~890 GB free.
+  retentionCount: 4
+  # Seconds after 02:30 UTC within which a missed run still starts. With no deadline a
+  # node that was not up at that minute skips the night entirely, silently, and this is
+  # the only copy of uploads/ and vector_db/ outside the data disk. 0 or a deleted line
+  # both fall back to 3600, because the template renders this with `| default 3600`.
+  startingDeadlineSeconds: 3600
+  # Injected by ./deploy.sh from LIVE_DATA_PATH and BACKUP_DATA_PATH in .env.
+  sourcePath: ""
+  hostPath: ""
+  # The deploying user's uid/gid, injected by ./deploy.sh from whoever runs it,
+  # so the archives are owned by the same user as the data tree. The template
+  # refuses to render without them.
+  runAsUser: ""
+  runAsGroup: ""
+  image:
+    repository: alpine
+    tag: "3.24.4"
+    pullPolicy: IfNotPresent
+  # The uploads backup held no requests or limits at all, so a tar of the whole
+  # volume could burst into any spare capacity. These are the `small` profile's
+  # values; ./deploy.sh renders them from MESSAGE_SCALE, and the backup envelope
+  # grows with the profile because the volume it archives does.
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "300m"
+      memory: "512Mi"
+

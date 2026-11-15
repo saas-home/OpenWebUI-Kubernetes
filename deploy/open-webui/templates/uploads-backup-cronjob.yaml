@@ -1,0 +1,212 @@
+{{- if .Values.uploadsBackup.enabled }}
+{{- if not (regexMatch "^[0-9]+$" (.Values.uploadsBackup.retentionCount | toString)) }}
+{{- fail "uploadsBackup.retentionCount must be a plain integer (days of archives to keep)" }}
+{{- end }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ .Release.Name }}-uploads-backup
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: uploads-backup
+spec:
+  schedule: {{ .Values.uploadsBackup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # Same reason as the postgresql backup CronJob: a missed schedule with no deadline is
+  # skipped silently, so the one copy of uploads/ and vector_db/ on the second disk just
+  # stops being taken while every job still reports success.
+  startingDeadlineSeconds: {{ .Values.uploadsBackup.startingDeadlineSeconds | default 3600 }}
+  jobTemplate:
+    spec:
+      # Each retry re-reads the whole volume, so cap the retries: one covers a
+      # transient fault without a broken night writing a dozen 1.8 GB archives.
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            # Deliberately NOT the open-webui label set. The app Service selects on
+            # app.kubernetes.io/component=open-webui + instance, so a job pod
+            # carrying those labels joins the Service endpoints while it runs and
+            # gets load-balanced traffic with nothing listening behind it.
+            app.kubernetes.io/name: uploads-backup
+            app.kubernetes.io/instance: {{ .Release.Name }}
+            app.kubernetes.io/component: uploads-backup
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            # The deploying user, injected by ./deploy.sh from whoever runs it:
+            # the archives this job writes into the backup root then belong to the
+            # same user that owns the rest of the tree. runAsNonRoot is the
+            # fail-visible guard, the same shape the postgres and SearXNG pods carry.
+            runAsNonRoot: true
+            runAsUser: {{ required "uploadsBackup.runAsUser is empty — run ./deploy.sh (it injects the deploying user's uid)" .Values.uploadsBackup.runAsUser }}
+            runAsGroup: {{ required "uploadsBackup.runAsGroup is empty — run ./deploy.sh (it injects the deploying user's gid)" .Values.uploadsBackup.runAsGroup }}
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+          - name: uploads-backup
+            image: "{{ .Values.uploadsBackup.image.repository }}:{{ .Values.uploadsBackup.image.tag }}"
+            imagePullPolicy: {{ .Values.uploadsBackup.image.pullPolicy }}
+            env:
+            - name: SRC
+              value: {{ required "uploadsBackup.sourcePath is empty — run ./deploy.sh (it injects it from LIVE_DATA_PATH in .env)" .Values.uploadsBackup.sourcePath | quote }}
+            - name: DEST_DIR
+              value: {{ required "uploadsBackup.hostPath is empty — run ./deploy.sh (it injects it from BACKUP_DATA_PATH in .env)" .Values.uploadsBackup.hostPath | quote }}
+            - name: UPLOADS_KEEP_DAYS
+              value: {{ .Values.uploadsBackup.retentionCount | quote }}
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop:
+                - ALL
+                # No DAC_OVERRIDE: every file in the volume is owned by the app
+                # user (the pod runs as that user), so tar reads them directly.
+                # The capability existed while the app ran as root and left
+                # non-world-readable files behind.
+            command: ['sh', '-c']
+            args:
+            - |
+              set -eu
+
+              # SRC, DEST_DIR and the retention budget arrive as container env
+              # vars, never interpolated into this script: they are derived from
+              # LIVE_DATA_PATH / BACKUP_DATA_PATH in .env, and a value carrying
+              # $( ) or a quote must stay data, not code. The deploy script
+              # whitelists the path character classes on top of this.
+              TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+              BASE=$(basename "$SRC")
+              OUT="${DEST_DIR}/${BASE}_${TIMESTAMP}.tar.gz"
+
+              if [ ! -d "$SRC" ]; then
+                echo "ERROR: $SRC does not exist; nothing to back up." >&2
+                exit 1
+              fi
+
+              size_h() {
+                local b
+                b=$(( $(wc -c < "$1") ))
+                if [ "$b" -ge 1048576 ]; then
+                  echo "$((b / 1048576))M"
+                elif [ "$b" -ge 1024 ]; then
+                  echo "$((b / 1024))K"
+                else
+                  echo "${b}B"
+                fi
+              }
+
+              # The directory may pre-exist, owned by the deploying user: a
+              # non-root job cannot chmod a directory it does not own, so
+              # create it with 0755 only when missing; never re-chmod an
+              # existing one.
+              if [ ! -d "$DEST_DIR" ] && ! install -d -m 0755 "$DEST_DIR"; then
+                echo "ERROR: could not create $DEST_DIR." >&2
+                exit 1
+              fi
+
+              # Counted before the tar, so the completeness check below has a fixed
+              # reference even if the app writes during the archive.
+              SRC_COUNT=$(find "$SRC" | wc -l)
+              echo "Archiving $SRC ($SRC_COUNT entries) at $(date)"
+
+              # tar exits 1 when a file changes while it is being read, which is
+              # normal for a volume an app is actively writing to, so 1 is tolerated
+              # and only >1 fails. No --warning=no-file-changed here: this image is
+              # Alpine, so tar is busybox tar, which has no such option and answers
+              # with its usage text and exit 1 -- the flag made the job look like a
+              # benign change and then fail on the missing file. Correctness rests on
+              # the three checks below, not on tar's exit status.
+              rc=0
+              tar -czf "${OUT}.part" -C "$(dirname "$SRC")" "$BASE" || rc=$?
+              if [ "$rc" -gt 1 ]; then
+                rm -f "${OUT}.part"
+                echo "ERROR: tar failed with exit ${rc}." >&2
+                exit 1
+              fi
+              if [ "$rc" -eq 1 ]; then
+                echo "NOTE: tar reported a warning (exit 1); the checks below decide whether the archive is usable."
+              fi
+
+              # gzip -t proves the stream is intact, tar -t proves the member table is
+              # readable. Both must pass before the archive is renamed into place, so
+              # a half-written file can never be the newest archive anyone finds.
+              if ! gzip -t "${OUT}.part"; then
+                rm -f "${OUT}.part"
+                echo "ERROR: ${OUT}.part is not a valid gzip stream." >&2
+                exit 1
+              fi
+              MEMBERS=$(tar -tzf "${OUT}.part" | wc -l)
+              if [ "$MEMBERS" -lt 1 ]; then
+                rm -f "${OUT}.part"
+                echo "ERROR: ${OUT}.part lists no members." >&2
+                exit 1
+              fi
+              # A member table far short of the source means something was skipped,
+              # not just changed. Half the entries is the threshold: generous enough
+              # for a burst of deletions, tight enough to catch a truncated tree.
+              if [ "$MEMBERS" -lt "$((SRC_COUNT / 2))" ]; then
+                rm -f "${OUT}.part"
+                echo "ERROR: ${OUT}.part has ${MEMBERS} members but the source had ${SRC_COUNT} entries." >&2
+                exit 1
+              fi
+              if ! mv -f "${OUT}.part" "$OUT"; then
+                rm -f "${OUT}.part"
+                echo "ERROR: could not move the verified archive into place at ${OUT}." >&2
+                exit 1
+              fi
+              echo "Uploads archive: ${OUT} (${MEMBERS} members, $(size_h "$OUT"))"
+
+              # Retain by distinct day, matching the Postgres CronJob: a hand-run job
+              # on the same day shares one slot and cannot evict older days. Anything
+              # that fails verification is removed rather than kept as a restore point
+              # that does not exist.
+              KEEP="$UPLOADS_KEEP_DAYS"
+              for f in "${DEST_DIR}/${BASE}"_*.tar.gz; do
+                [ -e "$f" ] || continue
+                if ! gzip -t "$f" 2>/dev/null || ! tar -tzf "$f" >/dev/null 2>&1; then
+                  rm -f "$f"
+                  echo "Removed unverifiable archive: $f"
+                fi
+              done
+              keep_days=$(ls -1t "${DEST_DIR}/${BASE}"_*.tar.gz 2>/dev/null \
+                | sed -E "s#.*/${BASE}_([0-9]{8})_[0-9]{6}\.tar\.gz\$#\1#" \
+                | awk -v k="$KEEP" '!seen[$0]++ && ++i <= k {print}' || true)
+              if [ -n "$keep_days" ]; then
+                removed=0
+                for f in "${DEST_DIR}/${BASE}"_*.tar.gz; do
+                  [ -e "$f" ] || continue
+                  day=$(basename "$f" | sed -E "s/^${BASE}_([0-9]{8})_[0-9]{6}\.tar\.gz\$/\1/")
+                  if ! printf '%s\n' "$keep_days" | grep -qx "$day"; then
+                    rm -f "$f"
+                    removed=$((removed + 1))
+                  fi
+                done
+                if [ "$removed" -gt 0 ]; then
+                  echo "Rotated uploads: removed ${removed} archive(s) outside the newest ${KEEP} day(s)"
+                fi
+              fi
+
+              echo "Uploads backup complete at $(date)"
+              ls -lh "${DEST_DIR}"/${BASE}_*.tar.gz || true
+            volumeMounts:
+            - name: source
+              mountPath: {{ required "uploadsBackup.sourcePath is empty — run ./deploy.sh" .Values.uploadsBackup.sourcePath | quote }}
+              readOnly: true
+            - name: dest
+              mountPath: {{ required "uploadsBackup.hostPath is empty — run ./deploy.sh" .Values.uploadsBackup.hostPath | quote }}
+            {{- with .Values.uploadsBackup.resources }}
+            resources:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+          volumes:
+          - name: source
+            hostPath:
+              path: {{ required "uploadsBackup.sourcePath is empty — run ./deploy.sh (it injects it from LIVE_DATA_PATH in .env)" .Values.uploadsBackup.sourcePath | quote }}
+              type: Directory
+          - name: dest
+            hostPath:
+              path: {{ required "uploadsBackup.hostPath is empty — run ./deploy.sh (it injects it from BACKUP_DATA_PATH in .env)" .Values.uploadsBackup.hostPath | quote }}
+              type: DirectoryOrCreate
+{{- end }}
