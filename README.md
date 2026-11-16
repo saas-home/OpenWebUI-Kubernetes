@@ -5,9 +5,7 @@ deployment turns your OpenAI-compatible model endpoint into a ChatGPT-style
 workspace where every person signs in under their own account, with their
 own private chat history, uploads, and settings — and gets their own `sk-`
 API key, so personal scripts, IDE plugins, and apps use the shared model
-under each user's own identity and permissions. The first account you create
-is the admin; every new signup waits in a pending queue until you approve
-them.
+under each user's own identity and permissions.
 
 This repository is the deployment layer: a ready-to-run
 [Open WebUI](https://openwebui.com) stack — a PostgreSQL database, a private
@@ -705,8 +703,13 @@ confirmation, and the bundle is verified before anything is touched:
 5. start the app and verify `/health` and the chat row count against the
    manifest.
 
-It will **not** bootstrap the host: if K3s is not running it stops and points
-at `./deploy/bootstrap-root.sh` and `./deploy/bootstrap-host.sh`. Restoring onto
+It will **not** bootstrap the host: if K3s is not running it waits up to two
+minutes for the API server to answer, then stops and points
+at `./deploy/bootstrap-root.sh` and `./deploy/bootstrap-host.sh`. If you ran
+`uninstall.sh` stage 4 (which removes K3s), run `sudo ./deploy/bootstrap-root.sh`
+first and then `restore.sh` — the Secrets, `.env`, host paths, deploy and data
+all come from the bundle, so `bootstrap-host.sh`'s wizard and `secret-init.sh`
+are not needed before a restore. Restoring onto
 a running stack **replaces its data** — deliberate — but only when
 the bundle's data roots match the host's: local PVs pin the paths and the field
 is immutable, so a bundle from another root is refused before anything changes.

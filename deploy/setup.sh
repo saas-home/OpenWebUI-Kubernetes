@@ -375,8 +375,20 @@ for entry in "${HOST_PATHS[@]}"; do
         bad "could not create $path even with sudo."
       fi
     elif install -d "$path" 2>/dev/null; then
-      warn "$path was created as $(id -un) because passwordless sudo is unavailable. Fix ownership before deploying:
+      # The kubelet's fsGroup rescues group ownership for Deployment hostPath
+      # mounts at pod start, but the backup CronJob's hostPath mounts are not
+      # rescued the same way (observed twice on this host): they stay exactly
+      # as created, and a uid-70 job then cannot write them. With no sudo,
+      # world-writable is the operator-approved fallback; the designed
+      # ownership is still recommended.
+      if (( uid != $(id -u) )) && [[ "$uid" != 0 ]]; then
+        chmod o+w "$path" 2>/dev/null || true
+        warn "$path was created as $(id -un) with mode o+w (no sudo available): the container user ($uid) can write it. Designed ownership:
           sudo chown $uid:$gid '$path' && sudo chmod $mode '$path'"
+      else
+        warn "$path was created as $(id -un) because passwordless sudo is unavailable. Fix ownership before deploying:
+          sudo chown $uid:$gid '$path' && sudo chmod $mode '$path'"
+      fi
     else
       bad "$path does not exist and cannot be created by $(id -un). Run: sudo install -d -o $uid -g $gid -m $mode $path"
     fi
@@ -421,7 +433,7 @@ declared=$( {
       done
   # The open-webui PV template hardcodes the open-webui subdirectory of the live root.
   grep -ohE '\$\{LIVE_DATA_PATH\}/[a-z0-9-]+' "$MANIFESTS/open-webui-volume.yaml.template" 2>/dev/null \
-    | sed -E "s@.\{LIVE_DATA_PATH\}@${LIVE_ROOT}@"
+    | sed -E "s@\\\$\{LIVE_DATA_PATH\}@${LIVE_ROOT}@"
 } | sort -u )
 # The derivation above greps the deploy scripts for a fixed code shape
 # (req('LIVE_DATA_PATH') + '/sub'). If that shape is ever refactored the grep

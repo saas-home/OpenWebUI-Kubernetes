@@ -4,4 +4,5 @@ description: Shared PostgreSQL database for K3s AI services
 type: application
 version: 0.1.0
 appVersion: "18.7"
-license: MIT
+annotations:
+  licenses: MIT

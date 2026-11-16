@@ -4,7 +4,8 @@ description: Open WebUI + SearXNG stack for K3s
 type: application
 version: 0.1.0
 appVersion: "0.13.3"
-license: MIT
+annotations:
+  licenses: MIT
 
 dependencies:
   - name: searxng

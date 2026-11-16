@@ -346,7 +346,7 @@ ok "detected capacity: $HOST_CORES CPU cores, $HOST_MEM_GB GB RAM available, $HO
 note "MESSAGE_SCALE decides the whole resource envelope (CPU and memory limits, uvicorn workers, Postgres cache and max_connections). The deploy scripts refuse a scale the values below cannot carry, and name the shortfall."
 
 # ── 4. .env configuration wizard ─────────────────────────────────────────────
-section ".env configuration (10 required keys + 2 optional data paths + 4 capacity keys + optional Google SSO pair)"
+section ".env configuration (7 required site keys + 2 optional data paths + 4 capacity keys)"
 # The wizard asks for every key, validates it before accepting, and stores it
 # in .env immediately -- so a Ctrl-C mid-run leaves a file that is either
 # complete for the keys already answered or still holds the template
@@ -570,11 +570,7 @@ if [[ -f "$ENV_FILE" ]] && (( ! CHECK_ONLY )); then
   if (( ${#still_missing[@]} )); then
     bad ".env is still incomplete: ${still_missing[*]}. Re-run the wizard or edit $ENV_FILE by hand."
   else
-    if [[ -n "$gcid" ]]; then
-      ok ".env complete: 10 required keys set, MESSAGE_SCALE=${scale:-small}, Google SSO enabled (mode $(stat -c %a "$ENV_FILE"))"
-    else
-      ok ".env complete: 10 required keys set, MESSAGE_SCALE=${scale:-small}, Google SSO off (login form) (mode $(stat -c %a "$ENV_FILE"))"
-    fi
+    ok ".env complete: 7 required site keys set, MESSAGE_SCALE=${scale:-small} (mode $(stat -c %a "$ENV_FILE"))"
   fi
 fi
 

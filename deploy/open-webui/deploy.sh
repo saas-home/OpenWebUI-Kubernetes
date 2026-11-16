@@ -57,7 +57,8 @@ OPTIONAL_VARS=()
 # The manifest carries names, salts and hashes only — never a value.
 manifest_check() {
   local ref salt expected m_secret m_key live actual drift=0
-  while read -r ref salt expected; do
+  while read -r ref salt expected || [[ -n "${ref:-}" ]]; do
+    [[ -z "$ref" || "$ref" =~ ^[[:space:]]*# ]] && continue
     m_secret="${ref%%/*}"; m_key="${ref#*/}"
     live="$(kubectl get secret "$m_secret" -n "$NAMESPACE" -o jsonpath="{.data.$m_key}" 2>/dev/null | base64 -d 2>/dev/null || true)"
     actual="$(printf '%s' "$live" | openssl dgst -sha256 -hmac "$salt" -hex 2>/dev/null | awk '{print $NF}')"
@@ -700,6 +701,32 @@ ensure_dependencies() {
   rm -f Chart.lock
 }
 
+compare_release_values() { # <rendered-values-file> ; live JSON on stdin
+  python3 -c '
+import json, sys
+try:
+    live = json.load(sys.stdin)
+except ValueError:
+    sys.stderr.write("the release values are not valid JSON\n")
+    sys.exit(3)
+want = json.load(open(sys.argv[1]))
+bad = []
+def walk(path, want_node, live_node):
+    if isinstance(want_node, dict):
+        if not isinstance(live_node, dict):
+            bad.append(path or "<root>")
+            return
+        for key, value in want_node.items():
+            walk(path + "." + key if path else key, value, live_node.get(key))
+    elif live_node != want_node:
+        bad.append(path)
+walk("", want, live)
+if bad:
+    print(" ".join(sorted(bad)))
+    sys.exit(1)
+' "$1"
+}
+
 if [[ "$MODE" == "check" ]]; then
   echo "Comparing $ENV_FILE against the live release user-supplied values..."
   # "Cannot ask the cluster" and "release not installed" used to print the same line,
@@ -718,41 +745,24 @@ if [[ "$MODE" == "check" ]]; then
   # in on stdin and the rendered file by path: no credential ever reaches a command
   # line, and only key names are ever printed.
   gen_values
-  drifted=$(printf '%s' "$current" | python3 -c '
-import json, sys
-try:
-    live = json.load(sys.stdin)
-except ValueError:
-    sys.stderr.write("the release values are not valid JSON\n")
-    sys.exit(3)
-want = json.load(open(sys.argv[1]))
-bad = []
-for section, keys in want.items():
-    live_sec = live.get(section) if isinstance(live, dict) else None
-    for key, value in (keys.items() if isinstance(keys, dict) else []):
-        live_val = live_sec.get(key) if isinstance(live_sec, dict) else None
-        if live_val != value:
-            bad.append(f"{section}.{key}")
-if bad:
-    print(" ".join(sorted(bad)))
-    sys.exit(1)
-' "$GEN_VALUES") || drifted_rc=$?
+  drift=0
+  drifted=$(printf '%s' "$current" | compare_release_values "$GEN_VALUES") || drifted_rc=$?
   drifted_rc=${drifted_rc:-0}
-  rc=$drifted_rc
-  if [[ -f "$REPO_ROOT/secrets.manifest" ]]; then
-    manifest_check || rc=1
-  else
-    echo "NOTE: no secrets.manifest — run ./deploy/secret-init.sh once to record fingerprints."
-  fi
   case "$drifted_rc" in
     0) echo "OK: every key the deploy would write matches $ENV_FILE." ;;
     1) echo "DRIFT: the live release differs from $ENV_FILE for: $drifted" >&2
        echo "       Run ./deploy.sh to reconcile." >&2
-       exit 1 ;;
+       drift=1 ;;
     *) echo "ERROR: could not read the live values of release $RELEASE." >&2
        exit 1 ;;
   esac
-  exit "$rc"
+
+  if [[ -f "$REPO_ROOT/secrets.manifest" ]]; then
+    manifest_check || drift=1
+  else
+    echo "NOTE: no secrets.manifest — run ./deploy/secret-init.sh once to record fingerprints."
+  fi
+  exit "$drift"
 fi
 
 ensure_dependencies
@@ -936,7 +946,7 @@ if kubectl get secret "$SEARX_SECRET_NAME" -n "$NAMESPACE" >/dev/null 2>&1; then
     exit 1
   }
   brave_key_line=$(printf '%s\n' "$settings" | awk '
-    /^  - name: braveapi$/ { found = 1 }
+    /^[[:space:]]*- name: braveapi$/ { found = 1 }
     found && /api_key:/ { print; exit }
   ')
   if [[ -z "$brave_key_line" ]]; then

@@ -29,7 +29,8 @@ ENV_EXAMPLE="$(cd ../.. && pwd)/.env.example"
 # The manifest carries names, salts and hashes only — never a value.
 manifest_check() {
   local ref salt expected m_secret m_key live actual drift=0
-  while read -r ref salt expected; do
+  while read -r ref salt expected || [[ -n "${ref:-}" ]]; do
+    [[ -z "$ref" || "$ref" =~ ^[[:space:]]*# ]] && continue
     m_secret="${ref%%/*}"; m_key="${ref#*/}"
     live="$(kubectl get secret "$m_secret" -n "$NAMESPACE" -o jsonpath="{.data.$m_key}" 2>/dev/null | base64 -d 2>/dev/null || true)"
     actual="$(printf '%s' "$live" | openssl dgst -sha256 -hmac "$salt" -hex 2>/dev/null | awk '{print $NF}')"

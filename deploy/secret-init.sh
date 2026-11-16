@@ -64,7 +64,7 @@ kubectl get -n "$NAMESPACE" svc >/dev/null 2>&1 \
 # ── .env reader: same last-match-wins parse as the deploy scripts ────────────
 env_value() {
   [[ -f "$ENV_FILE" ]] || return 0
-  sed -n "s/^$1=//p" "$ENV_FILE" | tail -1
+  sed -n "s/^$1=//p" "$ENV_FILE" | tail -1 | tr -d '\r'
 }
 
 # ── fingerprint helpers ──────────────────────────────────────────────────────
@@ -195,7 +195,8 @@ if [[ "${1:-}" == "--check" ]]; then
   # fingerprint drift: what the manifest recorded vs what is live now
   if [[ -f "$MANIFEST" ]]; then
     drift=0
-    while read -r ref salt expected; do
+    while read -r ref salt expected || [[ -n "${ref:-}" ]]; do
+      [[ -z "$ref" || "$ref" =~ ^[[:space:]]*# ]] && continue
       m_secret="${ref%%/*}"; m_key="${ref#*/}"
       live="$(kubectl get secret "$m_secret" -n "$NAMESPACE" -o jsonpath="{.data.$m_key}" 2>/dev/null | base64 -d 2>/dev/null || true)"
       actual="$(fingerprint "$salt" "$live")"

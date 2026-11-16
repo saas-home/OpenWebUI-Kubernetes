@@ -110,7 +110,7 @@ fi
 # the same way backup.sh proved them before handing the bundle over.
 if [[ -f "$TMP/secrets.manifest" ]]; then
   if ! python3 - "$TMP/secrets.env" "$TMP/secrets.manifest" <<'PYEOF'
-import base64, subprocess, sys
+import base64, hashlib, hmac, sys
 
 secrets_file, manifest_file = sys.argv[1], sys.argv[2]
 dumped = {}
@@ -122,7 +122,7 @@ for line in open(secrets_file):
         dumped[name] = {}
     elif line.strip() and name:
         key, b64 = line.split(" ", 1)
-        dumped[name][key] = base64.b64decode(b64).decode()
+        dumped[name][key] = base64.b64decode(b64)
 
 bad = 0
 for line in open(manifest_file):
@@ -136,10 +136,7 @@ for line in open(manifest_file):
         print(f"FAIL: {ref} is in the manifest but not in the dumped secrets", file=sys.stderr)
         bad = 1
         continue
-    out = subprocess.run(
-        ["openssl", "dgst", "-sha256", "-hmac", salt],
-        input=value.encode(), capture_output=True, check=True)
-    actual = out.stdout.decode().strip().split(" ")[-1]
+    actual = hmac.new(salt.encode("utf-8"), value, hashlib.sha256).hexdigest()
     if actual != expected:
         print(f"FAIL: {ref} does not match the fingerprint manifest", file=sys.stderr)
         bad = 1
@@ -154,10 +151,10 @@ fi
 ok "the bundle verifies: $(ls "$TMP"/db/*.sql.gz 2>/dev/null | wc -l) database dump(s), volumes, env, secrets"
 
 # ── read the bundle's site values ────────────────────────────────────────────
-bund_env() { sed -n "s/^$1=//p" "$TMP/env.env" | tail -1; }
+bund_env() { sed -n "s/^$1=//p" "$TMP/env.env" | tail -1 | tr -d '\r'; }
 B_NODE="$(bund_env K3S_NODE_NAME)"
-B_LIVE="$(bund_env LIVE_DATA_PATH)";  B_LIVE="${B_LIVE/#\~/$HOME}";  B_LIVE="${B_LIVE:-$HOME/.open-webui/live-data}"
-B_BACKUP="$(bund_env BACKUP_DATA_PATH)"; B_BACKUP="${B_BACKUP/#\~/$HOME}"; B_BACKUP="${B_BACKUP:-$HOME/.open-webui/backup-data}"
+B_LIVE="$(bund_env LIVE_DATA_PATH)";  B_LIVE="${B_LIVE/#\~/$HOME}";  B_LIVE="${B_LIVE:-$HOME/.open-webui/live-data}"; B_LIVE="${B_LIVE%/}"
+B_BACKUP="$(bund_env BACKUP_DATA_PATH)"; B_BACKUP="${B_BACKUP/#\~/$HOME}"; B_BACKUP="${B_BACKUP:-$HOME/.open-webui/backup-data}"; B_BACKUP="${B_BACKUP%/}"
 B_PUSER="$(bund_env POSTGRES_USER)"; B_PDB="$(bund_env POSTGRES_DB)"
 # Same bundle-trust guard as the dump file names below: B_PUSER is interpolated
 # into the CREATE DATABASE ... OWNER statement, so both identifiers must be bare
@@ -177,9 +174,9 @@ note "database    : $B_PDB (role $B_PUSER), chat rows at backup time: ${CHAT_ROW
 # because after the .env is replaced the deploy scripts refuse with a pointer
 # to setup.sh — which cannot move an existing PV's path.
 if command -v helm >/dev/null 2>&1 && helm list -q -n default 2>/dev/null | grep -qE '^(ai-open-webui|postgres)$' && [[ -f "$ENV_FILE" ]]; then
-  cur_env() { sed -n "s/^$1=//p" "$ENV_FILE" | tail -1; }
-  CUR_LIVE="$(cur_env LIVE_DATA_PATH)";  CUR_LIVE="${CUR_LIVE/#\~/$HOME}";  CUR_LIVE="${CUR_LIVE:-$HOME/.open-webui/live-data}"
-  CUR_BACKUP="$(cur_env BACKUP_DATA_PATH)"; CUR_BACKUP="${CUR_BACKUP/#\~/$HOME}"; CUR_BACKUP="${CUR_BACKUP:-$HOME/.open-webui/backup-data}"
+  cur_env() { sed -n "s/^$1=//p" "$ENV_FILE" | tail -1 | tr -d '\r'; }
+  CUR_LIVE="$(cur_env LIVE_DATA_PATH)";  CUR_LIVE="${CUR_LIVE/#\~/$HOME}";  CUR_LIVE="${CUR_LIVE:-$HOME/.open-webui/live-data}"; CUR_LIVE="${CUR_LIVE%/}"
+  CUR_BACKUP="$(cur_env BACKUP_DATA_PATH)"; CUR_BACKUP="${CUR_BACKUP/#\~/$HOME}"; CUR_BACKUP="${CUR_BACKUP:-$HOME/.open-webui/backup-data}"; CUR_BACKUP="${CUR_BACKUP%/}"
   if [[ "$CUR_LIVE" != "$B_LIVE" || "$CUR_BACKUP" != "$B_BACKUP" ]]; then
     bad "this host runs the stack under LIVE=$CUR_LIVE / BACKUP=$CUR_BACKUP,"
     bad "but the bundle was made under LIVE=$B_LIVE / BACKUP=$B_BACKUP."
@@ -190,8 +187,21 @@ if command -v helm >/dev/null 2>&1 && helm list -q -n default 2>/dev/null | grep
 fi
 
 # K3s must be running; this script deploys into it but never installs it.
-if ! command -v kubectl >/dev/null 2>&1 || ! kubectl get nodes >/dev/null 2>&1; then
-  bad "K3s is not running on this host. Bootstrap first:"
+# bootstrap-root.sh returns before the API server finishes booting, so an
+# instant check misreads "still starting" as "not installed" — poll for up to
+# two minutes before refusing.
+if ! command -v kubectl >/dev/null 2>&1; then
+  bad "kubectl not found — K3s is not installed. Bootstrap first:"
+  echo "       sudo $SCRIPT_DIR/bootstrap-root.sh --node-name <name>"
+  echo "       $SCRIPT_DIR/bootstrap-host.sh --node-name <name>"
+  exit 1
+fi
+for _ in $(seq 1 24); do
+  kubectl get nodes >/dev/null 2>&1 && break
+  sleep 5
+done
+if ! kubectl get nodes >/dev/null 2>&1; then
+  bad "K3s is not answering (waited 120s). Bootstrap first:"
   echo "       sudo $SCRIPT_DIR/bootstrap-root.sh --node-name <name>"
   echo "       $SCRIPT_DIR/bootstrap-host.sh --node-name <name>"
   exit 1
@@ -320,7 +330,7 @@ ok "extracted the open-webui volume to $B_LIVE/open-webui"
 if [[ -f "$TMP/volumes/searxng.tar.gz" ]]; then
   searxng_pod="$(kubectl get pod -n default -o name 2>/dev/null | grep -i searxng | head -1 || true)"
   if [[ -n "$searxng_pod" ]]; then
-    cat "$TMP/volumes/searxng.tar.gz" | kubectl exec -i "${searxng_pod##*/}" -n default -- tar xzf - -C /etc/searxng
+    kubectl exec -i "${searxng_pod##*/}" -n default -c searxng -- tar xzf - -C /etc/searxng < "$TMP/volumes/searxng.tar.gz"
     ok "restored the SearXNG config (in-pod, so ownership stays uid 977)"
   else
     note "no SearXNG pod to restore into; its config regenerates on pod start"
@@ -331,7 +341,9 @@ fi
 section "Step 4 — start the app and verify"
 kubectl scale statefulset/ai-open-webui -n default --replicas=1
 kubectl rollout status statefulset/ai-open-webui -n default --timeout=300s
-health="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 http://localhost:30000/health)"
+NODE_PORT=$(kubectl get svc ai-open-webui -n default -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || true)
+NODE_PORT="${NODE_PORT:-30000}"
+health="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "http://localhost:${NODE_PORT}/health")"
 [[ "$health" == "200" ]] || { bad "/health returned $health, not 200."; exit 1; }
 ok "/health: 200"
 if [[ -n "$CHAT_ROWS" && "$CHAT_ROWS" != "unknown" ]]; then

@@ -79,7 +79,7 @@ command -v openssl >/dev/null 2>&1 || { bad "openssl is not installed but is req
 [[ -f "$ENV_FILE" ]] || { bad "$ENV_FILE not found; nothing to back up."; exit 1; }
 [[ -d "$DEST" ]] || { bad "destination $DEST does not exist."; exit 1; }
 
-env_value() { sed -n "s/^$1=//p" "$ENV_FILE" | tail -1; }
+env_value() { sed -n "s/^$1=//p" "$ENV_FILE" | tail -1 | tr -d '\r'; }
 LIVE_PATH="$(env_value LIVE_DATA_PATH)"; LIVE_PATH="${LIVE_PATH/#\~/$HOME}"; LIVE_PATH="${LIVE_PATH:-$HOME/.open-webui/live-data}"
 if [[ "$DEST" == "$LIVE_PATH" || "$DEST" == "$LIVE_PATH"/* ]]; then
   bad "destination $DEST is under the live data root $LIVE_PATH; a backup must live elsewhere."
@@ -121,7 +121,12 @@ get_passphrase() {
 # ── staging + cleanup ─────────────────────────────────────────────────────────
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/owui-backup.XXXXXX")"
 VTMP=""
+BUNDLE_OUT=""
+VERIFIED=0
 cleanup() {
+  if (( ! VERIFIED )) && [[ -n "$BUNDLE_OUT" && -f "$BUNDLE_OUT" ]]; then
+    rm -f "$BUNDLE_OUT" 2>/dev/null || true
+  fi
   [[ -n "$VTMP" ]] && rm -rf "$VTMP" 2>/dev/null || true
   rm -rf "$TMP" 2>/dev/null || true
 
@@ -149,8 +154,8 @@ ok "copied .env"
 umask 077
 : > "$TMP/secrets.env"
 dump_secret() { # <name> <required:0|1>
-  local name="$1" required="$2" keys k b64
-  if ! keys="$(kubectl get secret "$name" -n default -o jsonpath='{.data}' 2>/dev/null)"; then
+  local name="$1" required="$2"
+  if ! kubectl get secret "$name" -n default -o jsonpath='{.data}' >/dev/null 2>&1; then
     if (( required )); then
       bad "Secret $name does not exist in default — the stack cannot run without it."
       exit 1
@@ -159,10 +164,11 @@ dump_secret() { # <name> <required:0|1>
     return 0
   fi
   printf '#secret %s\n' "$name" >> "$TMP/secrets.env"
-  for k in $(kubectl get secret "$name" -n default -o jsonpath='{.data}' 2>/dev/null | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)))'); do
-    b64="$(kubectl get secret "$name" -n default -o jsonpath="{.data.$k}")"
-    printf '%s %s\n' "$k" "$b64" >> "$TMP/secrets.env"
-  done
+  kubectl get secret "$name" -n default -o jsonpath='{.data}' 2>/dev/null | python3 -c '
+import json, sys
+for k, v in json.load(sys.stdin).items():
+    print(f"{k} {v}")
+' >> "$TMP/secrets.env"
   ok "dumped Secret $name"
 }
 dump_secret postgres 1
@@ -222,7 +228,7 @@ tar czf "$TMP/volumes/open-webui.tar.gz" -C "$LIVE_PATH/open-webui" .
 ok "archived the open-webui volume"
 searxng_pod="$(kubectl get pod -n default -o name 2>/dev/null | grep -i searxng | head -1 || true)"
 if [[ -n "$searxng_pod" ]]; then
-  kubectl exec -i "${searxng_pod##*/}" -n default -- tar czf - -C /etc/searxng . > "$TMP/volumes/searxng.tar.gz"
+  kubectl exec -i "${searxng_pod##*/}" -n default -c searxng -- tar czf - -C /etc/searxng . > "$TMP/volumes/searxng.tar.gz"
   ok "archived the SearXNG config"
 else
   note "no running SearXNG pod; the bundle has no SearXNG archive (its config regenerates on pod start)"
@@ -258,16 +264,17 @@ tar czf "$TMP/$bundle_base.tar.gz" -C "$TMP" db volumes env.env secrets.env mani
 ok "staged $bundle_base.tar.gz"
 
 # encrypt
+BUNDLE_OUT="$DEST/$bundle_base.tar.gz.gpg"
 gpg --batch --yes --quiet --symmetric --cipher-algo AES256 \
     --pinentry-mode loopback --passphrase-fd 3 \
-    --output "$DEST/$bundle_base.tar.gz.gpg" "$TMP/$bundle_base.tar.gz" 3<<<"$PASSPHRASE"
-ok "encrypted to $DEST/$bundle_base.tar.gz.gpg"
+    --output "$BUNDLE_OUT" "$TMP/$bundle_base.tar.gz" 3<<<"$PASSPHRASE"
+ok "encrypted to $BUNDLE_OUT"
 
 # ── verify: decrypt again and check every member ─────────────────────────────
 section "Verifying the bundle"
 VTMP="$(mktemp -d "${TMPDIR:-/tmp}/owui-verify.XXXXXX")"
 gpg --batch --quiet --pinentry-mode loopback --passphrase-fd 3 \
-    --output "$VTMP/bundle.tar.gz" "$DEST/$bundle_base.tar.gz.gpg" 3<<<"$PASSPHRASE"
+    --output "$VTMP/bundle.tar.gz" "$BUNDLE_OUT" 3<<<"$PASSPHRASE"
 tar xzf "$VTMP/bundle.tar.gz" -C "$VTMP"
 [[ -f "$VTMP/manifest.txt" && -f "$VTMP/env.env" && -f "$VTMP/secrets.env" ]] \
   || { bad "decrypted bundle is missing manifest, env or secrets."; exit 1; }
@@ -281,7 +288,7 @@ grep -q '^#secret ai-open-webui-secrets' "$VTMP/secrets.env" || { bad "decrypted
 # trailer, which a plain "file exists" check does not give.
 if [[ -f "$VTMP/secrets.manifest" ]]; then
   if ! python3 - "$VTMP/secrets.env" "$VTMP/secrets.manifest" <<'PYEOF'
-import base64, subprocess, sys
+import base64, hashlib, hmac, sys
 
 secrets_file, manifest_file = sys.argv[1], sys.argv[2]
 dumped = {}
@@ -293,7 +300,7 @@ for line in open(secrets_file):
         dumped[name] = {}
     elif line.strip() and name:
         key, b64 = line.split(" ", 1)
-        dumped[name][key] = base64.b64decode(b64).decode()
+        dumped[name][key] = base64.b64decode(b64)
 
 bad = 0
 for line in open(manifest_file):
@@ -307,10 +314,7 @@ for line in open(manifest_file):
         print(f"FAIL: {ref} is in the manifest but not in the dumped secrets", file=sys.stderr)
         bad = 1
         continue
-    out = subprocess.run(
-        ["openssl", "dgst", "-sha256", "-hmac", salt],
-        input=value.encode(), capture_output=True, check=True)
-    actual = out.stdout.decode().strip().split(" ")[-1]
+    actual = hmac.new(salt.encode("utf-8"), value, hashlib.sha256).hexdigest()
     if actual != expected:
         print(f"FAIL: {ref} does not match the fingerprint manifest", file=sys.stderr)
         bad = 1
@@ -334,6 +338,7 @@ gzip -t "$VTMP/volumes/open-webui.tar.gz" && tar -tf "$VTMP/volumes/open-webui.t
   || { bad "the open-webui volume archive will not extract."; exit 1; }
 [[ -f "$VTMP/volumes/searxng.tar.gz" ]] && { gzip -t "$VTMP/volumes/searxng.tar.gz" && tar -tf "$VTMP/volumes/searxng.tar.gz" >/dev/null || { bad "the searxng archive will not extract."; exit 1; }; }
 rm -rf "$VTMP"; VTMP=""
+VERIFIED=1
 ok "the bundle decrypts and every member checks out"
 
 echo

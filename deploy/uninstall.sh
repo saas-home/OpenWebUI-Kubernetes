@@ -115,7 +115,7 @@ arith_gate() { # <stage label>
 # ── .env: resolve the two data roots the same way the deploy scripts do ─────
 env_value() {
   [[ -f "$ENV_FILE" ]] || return 0
-  sed -n "s/^$1=//p" "$ENV_FILE" | tail -1
+  sed -n "s/^$1=//p" "$ENV_FILE" | tail -1 | tr -d '\r'
 }
 resolve_data_root() { # <raw> <default> <label>
   local raw="${1-}" def="$2" label="$3" out
@@ -307,14 +307,14 @@ run_stage2() {
   if kubectl get pvc open-webui -n default >/dev/null 2>&1; then
     kubectl delete pvc open-webui -n default
   fi
+  if (( ${#leftovers[@]} )); then
+    kubectl delete pvc "${leftovers[@]}" -n default 2>/dev/null || true
+  fi
   for pv in open-webui-pv-local postgres-pv ai-open-webui-searxng-pv; do
     if kubectl get pv "$pv" >/dev/null 2>&1; then
       kubectl delete pv "$pv"
     fi
   done
-  if (( ${#leftovers[@]} )); then
-    kubectl delete pvc "${leftovers[@]}" -n default 2>/dev/null || true
-  fi
   if (( sc )); then
     kubectl delete sc local-storage
   fi
@@ -489,7 +489,7 @@ run_stage4() {
   # # sticks to the path, no space) and left /etc/fstab.bak. Re-enable only when
   # a commented swap line is present.
   local swap=0
-  if [[ -f /etc/fstab && ! $([[ "$(swapon --noheadings 2>/dev/null)" ]] && echo yes) ]]; then
+  if [[ -f /etc/fstab ]] && ! swapon --noheadings 2>/dev/null | grep -q .; then
     if grep -qE '^[[:space:]]*#.*[[:space:]]+swap[[:space:]]' /etc/fstab; then
       swap=1
     else
