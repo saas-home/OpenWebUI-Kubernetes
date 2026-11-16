@@ -60,6 +60,7 @@ deploy/
 ├── backup.sh      ← portable encrypted backup bundle (GPG AES256), round-trip verified
 ├── restore.sh     ← restore a backup bundle onto the same or a new host
 ├── uninstall.sh   ← staged uninstall (4 stages) with a stage-0 backup offer
+├── smoke-test.sh  ← layered no-browser health check (tiers 1-6); read-only except two manual jobs
 ├── cluster/       ← manifests for the three objects no chart owns
 ├── postgresql/    ← PostgreSQL chart + its deploy.sh
 └── open-webui/    ← Open WebUI chart, SearXNG subchart + its deploy.sh
@@ -72,7 +73,8 @@ deploy/
 | `deploy/setup.sh` | prerequisite checks, host paths, cluster primitives, in-cluster credential-Secret verification, then `deploy.sh` | — | idempotent; `--check` changes nothing; never prompts for human keys (bootstrap-host.sh owns the wizard, secret-init.sh owns the credentials) |
 | `deploy/backup.sh` | portable encrypted backup bundle (`.env`, credential Secrets, dumps, both volumes) | — | GPG symmetric AES256; `--dest`, `--passphrase-file` (mode 600); round-trip verified before handover |
 | `deploy/restore.sh` | a backup bundle onto the same or a new host | — | decrypt+verify, `.env`, credential-Secret rebuild from the bundle, setup/deploy, DB + volume restore, verify; passphrase is the only confirmation; refuses to bootstrap the host (points at bootstrap-*) |
-| `deploy/uninstall.sh` | staged uninstall, 4 stages, with a stage-0 backup offer | — | `--check` is plan mode; one arithmetic gate at the start of the run (three tries); no `--yes`; stage 2 deletes the credential Secrets, stage 3 deletes `.env` + `secrets.manifest` and names every previous backup; stage 4 removes apt packages only if unused and not needed by the repo's own scripts |
+| `deploy/uninstall.sh` | staged uninstall, 4 stages, with a stage-0 backup offer | — | `--check` is plan mode; one arithmetic gate at the start of the run (three tries); no `--yes`; every stage prompt names what that stage will delete before the [y/N]; stage 2 deletes the credential Secrets, stage 3 deletes `.env` + `secrets.manifest` and names every previous backup; stage 4 removes apt packages only if unused and not needed by the repo's own scripts |
+| `deploy/smoke-test.sh` | nothing — it verifies | — | layered no-browser health check (scripts, charts, drift, cluster shape, app serving, app function, backup gate lines); `--quick`/`--no-backup` skip the slow tiers; `SMOKE_API_KEY` unlocks the per-user chat-completion test (env only, never argv); exit 1 on any failure |
 | `deploy/cluster/manifests/` | `local-storage` StorageClass, `open-webui` PV + PVC | — | applied by `setup.sh`; the PV/PVC file is a template with the node name and the live data root in it |
 | `deploy/postgresql/` | PostgreSQL 18 (Alpine) + backup CronJob | `postgres` | release name is mandatory, see gotchas |
 | `deploy/open-webui/` | Open WebUI + SearXNG + Redis + uploads backup CronJob | `ai-open-webui` | connects to Postgres at startup; image and chart versions live in `Chart.yaml`/`values.yaml` |
@@ -820,6 +822,17 @@ major line. Read both from the files rather than trusting this sentence:
   `--from-file` never `--from-literal`, fingerprints recorded after apply, SSO mode
   from the Secret, backup/restore/uninstall handle `secrets.env` and the Secrets).
   Run it after touching any validation logic.
+- `deploy/smoke-test.sh` — the layered no-browser health check a user runs to
+  confirm a deployment works: tier 1 selftest + `helm lint` + chart render,
+  tier 2 the three `--check` modes, tier 3 pods/releases/PVC binding and the
+  `local-storage` no-provisioner guard, tier 4 `/health` + `/health/db` +
+  version + inference reachability, tier 5 SearXNG results plus (with
+  `SMOKE_API_KEY` in the environment, never argv) a real chat completion via
+  `/api/chat/completions`, tier 6 manual runs of both backup CronJobs judged by
+  their gate lines and the archives on disk. Read-only except creating and
+  deleting its two manual jobs; `--quick` / `--no-backup` skip the slow tiers;
+  exit 1 on any failure. It does not replace the browser checks in README's
+  "Check that it works".
 - `deploy/cluster/manifests/storageclass.yaml` — the `local-storage` StorageClass,
   `no-provisioner` by design
 - `deploy/cluster/manifests/open-webui-volume.yaml.template` — the `open-webui` PV/PVC no

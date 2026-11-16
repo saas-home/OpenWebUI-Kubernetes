@@ -331,6 +331,19 @@ credentials are gone by design.
 
 ## ✅ Check that it works
 
+The automated first stop is the smoke test — it runs every check that does not
+need a browser, from script self-tests up to the backup jobs' own gate lines:
+
+```bash
+./deploy/smoke-test.sh                 # tiers 1-6; ~3 minutes (backups dominate)
+./deploy/smoke-test.sh --quick         # skip --dry-run and the backup jobs
+SMOKE_API_KEY=sk-... ./deploy/smoke-test.sh   # also do a real chat completion as your user
+```
+
+It prints `OK`/`WARN`/`FAIL` per check and a summary, and exits non-zero if
+anything failed. `SMOKE_API_KEY` is read from the environment and passed to
+`curl` on stdin, never on a command line. Then spot-check by hand:
+
 ```bash
 curl -s -o /dev/null -w "%{http_code}\n" http://localhost:30000/health   # expect 200
 kubectl get pods -n default                                             # expect 1/1 Running
@@ -424,6 +437,7 @@ Four rules matter before you change anything:
 ./deploy/deploy.sh open-webui     # deploy only one component
 ./deploy/deploy.sh --pinned       # use values.yaml pins even on a fresh install
 ./deploy/selftest.sh              # test the scripts themselves; no cluster needed
+./deploy/smoke-test.sh            # verify the running stack: scripts, cluster, app, backups (no browser)
 
 kubectl get pods -n default
 curl -s -o /dev/null -w "%{http_code}\n" http://localhost:30000/health   # 200
@@ -722,13 +736,17 @@ The stack is removed in four stages by `./deploy/uninstall.sh`, which asks one
 small arithmetic question before the first stage that still has work to do
 (three tries at the question; a wrong answer stops the run with nothing
 changed). There is deliberately **no** `--yes` flag: a destructive run always
-stops for a human. A rerun after a partial run **resumes**: stages whose work
-is already done are skipped, so you can stop anywhere and pick it up later.
+stops for a human. Each stage also stops to ask before it runs, and the prompt
+**names what that stage will delete** — releases, then cluster objects and the
+credential Secrets, then the host data trees, then the host itself — so the
+`[y/N]` is an informed one. A rerun after a partial run **resumes**: stages whose
+work is already done are skipped, so you can stop anywhere and pick it up later.
 
 ```bash
 ./deploy/uninstall.sh --check   # show exactly what every stage would touch;
                                 # changes nothing, asks nothing
-./deploy/uninstall.sh           # run the stages in order; one gate at the start
+./deploy/uninstall.sh           # run the stages in order; one gate at the start,
+                                # then a what-this-deletes prompt per stage
 ./deploy/uninstall.sh 3         # run ONLY stage 3 (refuses if 1-2 are undone)
 ```
 

@@ -634,9 +634,32 @@ run_preamble() {
 
 # Sequential mode: after each stage, a plain yes/no decides whether to continue.
 # Default is stop, so a lost terminal cannot cascade into stage 4.
+stage_summary() { # <stage number> — what the next stage WILL do, kept in step
+  # with run_stage1..4 below; the y/N is only meaningful if it names the blast
+  # radius before asking.
+  case "$1" in
+    1) printf '     helm-uninstall the releases ai-open-webui and postgres.\n'
+       printf '     Nothing is deleted: the PVs are Retain and no host path is touched.\n' ;;
+    2) printf '     delete the cluster objects the releases do not own: the open-webui\n'
+       printf '     PV + PVC, the postgres/searxng PVs and PVCs, the local-storage\n'
+       printf '     StorageClass, and the THREE CREDENTIAL SECRETS (postgres,\n'
+       printf '     ai-open-webui-secrets, ai-open-webui-searxng).\n'
+       printf '     Host directories are still untouched.\n' ;;
+    3) printf '     DELETE HOST DATA: the LIVE_DATA_PATH and BACKUP_DATA_PATH trees\n'
+       printf '     (database, uploads, vector store, AND every nightly archive), the\n'
+       printf '     .env file, and secrets.manifest. Needs sudo. After this, the only\n'
+       printf '     recovery is an encrypted backup bundle.\n' ;;
+    4) printf '     RETURN THE HOST TO PRE-BOOTSTRAP: uninstall K3s and helm, remove\n'
+       printf '     /etc/rancher, the k3s module/sysctl drop-ins, and the bootstrap apt\n'
+       printf '     packages nothing else depends on, and re-enable swap. Needs sudo.\n'
+       printf '     The repository files on disk are left alone.\n' ;;
+  esac
+}
 continue_to() { # <next stage number>
   local ans
-  printf '\n  Continue to stage %s (of 4)? [y/N] ' "$1"
+  printf '\n  Continue to stage %s (of 4)? It will:\n' "$1"
+  stage_summary "$1"
+  printf '  Continue to stage %s? [y/N] ' "$1"
   read -r ans
   case "${ans,,}" in
     y|yes) return 0 ;;
