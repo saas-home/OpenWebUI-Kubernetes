@@ -3,7 +3,7 @@ name: ai-open-webui
 description: Open WebUI + SearXNG stack for K3s
 type: application
 version: 0.1.0
-appVersion: "0.13.3"
+appVersion: "0.13.4"
 annotations:
   licenses: MIT
 
@@ -12,5 +12,5 @@ dependencies:
     version: 0.1.0
     repository: "file://charts/searxng"
   - name: open-webui
-    version: "18.3.0"
+    version: "18.4.0"
     repository: "https://helm.openwebui.com/"

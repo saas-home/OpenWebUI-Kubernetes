@@ -4,7 +4,7 @@
 searxng:
   image:
     repository: searxng/searxng
-    tag: "2026.11.15-2d500cb6b"
+    tag: "2026.11.17-b99cf7496"
     pullPolicy: Always
   replicaCount: 1
 
@@ -47,7 +47,7 @@ searxng:
 open-webui:
   # Specify Open WebUI version (app version, not Helm chart version)
   image:
-    tag: "v0.13.3"
+    tag: "v0.13.4"
 
   # The upstream chart's built-in init container (copy-app-data — it copies the
   # image's /app/backend/data onto the PVC) doubles as the pip prewarmer. It
@@ -155,7 +155,7 @@ open-webui:
   # track open-webui.image.tag — selftest.sh enforces that they match.
   extraInitContainers:
     - name: db-migrate
-      image: ghcr.io/open-webui/open-webui:v0.13.3
+      image: ghcr.io/open-webui/open-webui:v0.13.4
       imagePullPolicy: IfNotPresent
       command:
         - python3
