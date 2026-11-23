@@ -497,7 +497,7 @@ git add <paths> && git commit -m "..." && git push
 - **fullname helper**: `_helpers.tpl` returns just `{{ .Release.Name }}`, which is why the
   release name **must** be `postgres` — that keeps DNS at
   `postgres.default.svc.cluster.local:5432`.
-- **Image**: official `postgres:18.6-alpine`, pinned to the patch release in `values.yaml`.
+- **Image**: official `postgres:19.0-alpine`, pinned to the patch release in `values.yaml`.
   The same tag drives both the Deployment and the `postgres-backup` CronJob. Single
   replica, `Recreate` strategy.
 - **Postgres runs non-root.** `podSecurityContext` in `values.yaml` pins the server pod

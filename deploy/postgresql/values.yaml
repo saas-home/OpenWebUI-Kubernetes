@@ -1,6 +1,6 @@
 image:
   repository: postgres
-  tag: "18.7-alpine"
+  tag: "19.0-alpine"
   pullPolicy: IfNotPresent
 
 # The database runs as the image's postgres account (uid 70), not root. This

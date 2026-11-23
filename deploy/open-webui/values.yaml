@@ -4,7 +4,7 @@
 searxng:
   image:
     repository: searxng/searxng
-    tag: "2026.11.17-b99cf7496"
+    tag: "2026.11.21-c6ee3e9fd"
     pullPolicy: Always
   replicaCount: 1
 

@@ -3,6 +3,6 @@ name: postgresql
 description: Shared PostgreSQL database for K3s AI services
 type: application
 version: 0.1.0
-appVersion: "18.7"
+appVersion: "19.0"
 annotations:
   licenses: MIT
