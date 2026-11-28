@@ -4,7 +4,7 @@
 searxng:
   image:
     repository: searxng/searxng
-    tag: "2026.11.21-c6ee3e9fd"
+    tag: "2026.11.28-d96f0ec9b"
     pullPolicy: Always
   replicaCount: 1
 
@@ -47,7 +47,7 @@ searxng:
 open-webui:
   # Specify Open WebUI version (app version, not Helm chart version)
   image:
-    tag: "v0.13.4"
+    tag: "v0.13.5"
 
   # The upstream chart's built-in init container (copy-app-data — it copies the
   # image's /app/backend/data onto the PVC) doubles as the pip prewarmer. It
@@ -119,7 +119,7 @@ open-webui:
   websocket:
     redis:
       image:
-        tag: "8.10.3-alpine3.23"
+        tag: "8.12.0-alpine3.23"
       # The broker held no requests or limits at all, so the scheduler could not
       # reason about it and it could burst into any spare capacity. These are the
       # `small` profile's values; ./deploy.sh renders them from MESSAGE_SCALE.
@@ -155,7 +155,7 @@ open-webui:
   # track open-webui.image.tag — selftest.sh enforces that they match.
   extraInitContainers:
     - name: db-migrate
-      image: ghcr.io/open-webui/open-webui:v0.13.4
+      image: ghcr.io/open-webui/open-webui:v0.13.5
       imagePullPolicy: IfNotPresent
       command:
         - python3

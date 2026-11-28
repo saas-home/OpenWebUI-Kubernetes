@@ -73,17 +73,23 @@ Where the current pin lives:
 
 ## How to check
 
-The six queries are independent. Run them **in parallel** in one batch of tool calls — sequencing them is the single biggest waste of time in this workflow.
+1. **Query registries in parallel.** The six queries are independent — run them in one batch of tool calls rather than sequentially.
 
-`helm search repo --versions` lists GA only, so it cannot show you what the GA policy is rejecting. Run it a second time with `--devel` and report the newest prerelease as considered-and-skipped; that is also how you tell "17.0.0 is the newest chart" from "17.0.1-dev.576.1 is waiting to be released".
+   `helm search repo --versions` lists GA only, so it cannot show you what the GA policy is rejecting. Run it a second time with `--devel` and report the newest prerelease as considered-and-skipped; that is also how you tell "17.0.0 is the newest chart" from "17.0.1-dev.576.1 is waiting to be released".
 
-Then report a table:
+2. **Collect upgrade details and benefits.** For every component that has a newer GA version available, fetch its release notes or commit summary between the current pin and the target GA version (for example, GitHub releases for Open WebUI / Redis / PostgreSQL, Helm chart release notes, and GitHub `compare/<old-sha>...<new-sha>` for SearXNG). Note any breaking changes or database migrations (`⚠️ Database Migrations`).
 
-| Component | Current | Latest GA | Status |
-|-----------|---------|-----------|--------|
-| ... | ... | ... | ✅ / ⚠️ |
+3. **Present the upgrade report and request per-component approval.** Before editing any files or running any backup or deploy commands, present:
+   - The version summary table:
 
-Call out anything skipped as a prerelease so the user can see it was considered and rejected.
+     | Component | Current | Latest GA | Status |
+     |-----------|---------|-----------|--------|
+     | ... | ... | ... | ✅ / ⚠️ |
+
+   - Any prereleases considered and skipped.
+   - For each outdated component: the **major benefits** of the upgrade and any **breaking changes / migration requirements**.
+
+   **Stop and ask the user to review and explicitly approve which components to upgrade.** Do not modify `values.yaml`, `Chart.yaml`, or deploy anything until the user confirms. Proceed only with the components the user approves.
 
 ## Preflight, before any deploy
 
@@ -146,7 +152,7 @@ kubectl exec -n default deploy/postgres -- psql -U openwebui -d openwebui -tAc "
 
 ## How to upgrade
 
-1. **Image tag changes** — edit the tag in the appropriate `values.yaml`.
+1. **Image tag changes** — edit the tag in the appropriate `values.yaml`. When bumping `open-webui.image.tag`, also update `open-webui.extraInitContainers[0].image` (`db-migrate`) in `deploy/open-webui/values.yaml` to the same tag so database migrations run with the new version.
 2. **Helm chart version change** — edit the dependency `version` in `Chart.yaml` (exact `X.Y.Z` only; there is no `Chart.lock` to re-resolve — `deploy.sh`'s `helm dependency build` pulls the pinned version).
 3. **appVersion** — update `appVersion` in the root `Chart.yaml` and in `charts/searxng/Chart.yaml` to match the pin you just edited, then run the pin-vs-`appVersion` gate in [Verifying a rollout](#verifying-a-rollout) and get `OK` on all three lines. Bumping a tag while leaving its `appVersion` behind is the specific miss this step exists to catch, and no other check in the repo reports it — the gate is the only thing that fails.
 4. **Deploy with the master script** — `./deploy/deploy.sh`, run from the repo root. It
